@@ -1,0 +1,196 @@
+# Voice Translator Configuration Reference
+# This file shows example configurations for different setups
+
+# ============================================
+# EXAMPLE 1: Offline Translation with Argos
+# ============================================
+# Translation Mode: argos
+# Source Language Code: en
+# Target Language Code: es
+#
+# Make sure the corresponding Argos models are installed:
+#   python download_argos_model.py en es
+
+# ============================================
+# EXAMPLE 2: Whisper Translate (Direct Audio Translation)
+# ============================================
+# Translation Mode: whisper_translate
+# Whisper API Host: http://localhost:9000
+# Whisper API Key: (optional)
+# Whisper Model: whisper-large-v3
+#
+# This sends the audio directly to Whisper and returns the translated English text.
+
+# ============================================
+# EXAMPLE 3: AI Translation with Ollama
+# ============================================
+# Translation Mode: ai
+# AI API Host: http://localhost:11434/v1
+# AI API Key: (leave empty for Ollama)
+# AI Model: llama3.2
+#
+# Make sure Ollama is running:
+#   ollama serve
+
+# ============================================
+# EXAMPLE 4: AI Translation with OpenAI
+# ============================================
+# Translation Mode: ai
+# AI API Host: https://api.openai.com/v1
+# AI API Key: sk-proj-...
+# AI Model: gpt-4-turbo-preview
+
+# ============================================
+# EXAMPLE 5: LibreTranslate (Self-hosted)
+# ============================================
+# Translation Mode: libretranslate
+# LibreTranslate Host: http://localhost:5000
+# LibreTranslate API Key: (leave empty if no auth)
+
+# ============================================
+# EXAMPLE 6: LibreTranslate (Cloud)
+# ============================================
+# Translation Mode: libretranslate
+# LibreTranslate Host: https://libretranslate.com
+# LibreTranslate API Key: your-api-key
+
+# ============================================
+# EXAMPLE 7: Internal Translation (Google Translate)
+# ============================================
+# Translation Mode: internal
+# (No additional configuration needed)
+# Uses Google Translate via translators library – requires internet.
+
+# ============================================
+# DISPLAY SETTINGS - OBS OVERLAY
+# ============================================
+# For a clean bottom-third overlay in OBS:
+# 
+# Recognized Text Size: 32
+# Translated Text Size: 24
+# Recognized Text Color: #FFFFFF (white)
+# Translated Text Color: #CCCCCC (light gray)
+# Text Alignment: center
+# Translation Position: after
+# Font Family: Arial
+#
+# OBS Browser Source Settings:
+# Width: 1920
+# Height: 200
+# CSS:
+#   body {
+#     background-color: rgba(0, 0, 0, 0);
+#     margin: 0px auto;
+#     overflow: hidden;
+#   }
+
+# ============================================
+# LANGUAGE CODES REFERENCE
+# ============================================
+# Common language codes for Source Language:
+#   en-US  - English (US)
+#   en-GB  - English (UK)
+#   es-ES  - Spanish (Spain)
+#   es-MX  - Spanish (Mexico)
+#   fr-FR  - French
+#   de-DE  - German
+#   it-IT  - Italian
+#   pt-BR  - Portuguese (Brazil)
+#   ru-RU  - Russian
+#   zh-CN  - Chinese (Simplified)
+#   ja-JP  - Japanese
+#   ko-KR  - Korean
+#
+# Common language codes for Target Language:
+#   en - English
+#   es - Spanish
+#   fr - French
+#   de - German
+#   it - Italian
+#   pt - Portuguese
+#   ru - Russian
+#   zh - Chinese
+#   ja - Japanese
+#   ko - Korean
+
+# ============================================
+# RECOMMENDED VOSK MODELS
+# ============================================
+# For best results, use these models:
+#
+# English (US):
+#   - Small: vosk-model-small-en-us-0.15 (40 MB)
+#   - Full: vosk-model-en-us-0.22 (1.8 GB)
+#
+# Spanish:
+#   - vosk-model-es-0.42 (1.4 GB)
+#
+# French:
+#   - vosk-model-fr-0.22 (1.4 GB)
+#
+# Download with:
+#   python download_models.py en-us
+#   python download_models.py es
+#   python download_models.py fr
+
+# ============================================
+# DOCKER DEPLOYMENT
+# ============================================
+# Basic deployment:
+#   docker-compose up -d
+#
+# With custom session:
+#   Edit docker-compose.yml:
+#   command: ["--host", "0.0.0.0", "--port", "7860", "--session", "my-event"]
+#
+# View logs:
+#   docker-compose logs -f
+#
+# Stop:
+#   docker-compose down
+
+# ============================================
+# NETWORK SHARING
+# ============================================
+# To share on local network:
+#   python app.py --host 0.0.0.0 --session my-event
+#
+# Access from other devices:
+#   http://YOUR_IP:7860
+#
+# Find your IP:
+#   Linux/Mac: ip addr show
+#   Windows: ipconfig
+
+# ============================================
+# PERFORMANCE TIPS
+# ============================================
+# 1. Use smaller models for faster processing
+# 2. Disable interim results if not needed
+# 3. Use internal translation for fastest results
+# 4. Close unused browser tabs to free resources
+# 5. For Docker, allocate sufficient memory (2GB+)
+
+# ============================================
+# TROUBLESHOOTING
+# ============================================
+# No audio input:
+#   - Check microphone permissions
+#   - Verify correct device selected
+#   - On Linux: sudo usermod -a -G audio $USER
+#
+# Model not loading:
+#   - Ensure model is fully extracted
+#   - Check models/ directory permissions
+#   - Verify model path is correct
+#
+# Translation not working:
+#   - Check internet connection (internal mode)
+#   - Verify API endpoints are accessible
+#   - Check API keys are correct
+#   - Review logs for error messages
+#
+# Docker audio issues:
+#   - Ensure host has audio devices
+#   - Check device permissions
+#   - Use --device /dev/snd in docker run

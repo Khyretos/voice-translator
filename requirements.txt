@@ -1,0 +1,9 @@
+gradio>=4.44.0
+vosk>=0.3.45
+sounddevice>=0.4.7
+numpy>=1.26.0,<2.0.0
+requests>=2.31.0
+translators>=5.9.1
+cffi>=1.15.0
+langdetect
+argostranslate
