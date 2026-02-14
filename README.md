@@ -46,7 +46,7 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 
 #### Vosk
 
-![alt text](image-1.png)
+![alt text](./images/image-1.png)
 
 #### Whisper
 
