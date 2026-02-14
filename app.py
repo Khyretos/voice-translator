@@ -117,14 +117,16 @@ window.startBrowserStreaming = function() {
         window.__audioStreamActive = false;
         return;
     }
-    var wsUrl = sessionDiv.dataset.wsUrl;
-    if (!wsUrl) {
-        console.error('WebSocket URL not found');
-        setStatus('Error: WebSocket URL missing');
+    var wsPath = sessionDiv.dataset.wsPath;
+    if (!wsPath) {
+        console.error('WebSocket path not found');
+        setStatus('Error: WebSocket path missing');
         window.__audioStreamActive = false;
         return;
     }
-
+    var wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var wsUrl = wsProtocol + '//' + window.location.host + wsPath;
+    
     navigator.mediaDevices.getUserMedia({ audio: true })
         .then(function(stream) {
             window.__mediaStream = stream;
@@ -1631,9 +1633,7 @@ def create_ui(args):
                 font_value = settings["font_family"]
 
             # Generate session data HTML for JS
-            ws_url = f"ws://{args.host}:{args.port}/ws/{request.session_hash}"
-            session_html = f'<div id="session-data" data-session="{request.session_hash}" data-ws-url="{ws_url}"><b>Each tab = separate session • Refresh = new session</b></div>'
-
+            session_html = f'<div id="session-data" data-session="{request.session_hash}" data-ws-path="/ws/{request.session_hash}"><b>Each tab = separate session • Refresh = new session</b></div>'
             # Return a dictionary of updates for all components
             return {
                 session_info: f"### 🎯 Session: `{request.session_hash[:8]}` | Active: {len(SESSION_APPS)}",
