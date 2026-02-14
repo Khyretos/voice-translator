@@ -40,6 +40,47 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 - **Comprehensive Logging** – real‑time logs in UI and persistent file logs
 - **Session Cleanup** – automatic cleanup of inactive sessions
 
+## Screenshots
+
+### Speech recognition
+
+#### Vosk
+
+![alt text](image-1.png)
+
+#### Whisper
+
+![alt text](./images/image.png)
+
+### Audio options
+
+#### Hardware
+
+![alt text](./images/image-2.png)
+
+### Translation
+
+#### Argos
+
+![alt text](./images/image-3.png)
+
+#### AI
+
+![alt text](./images/image-4.png)
+
+#### Libretranslate
+
+![alt text](./images/image-5.png)
+
+#### Whisper translate
+
+![alt text](./images/image-6.png)
+
+### Display style
+
+![alt text](./images/image-7.png)
+![alt text](./images/image-10.png)
+
 ## 📋 Requirements
 
 ### System Requirements
