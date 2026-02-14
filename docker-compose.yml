@@ -9,6 +9,7 @@ services:
     volumes:
       - ./vosk_models:/app/vosk_models
       - ./argos_models:/app/argos_models
+      - ./fonts:/app/fonts
       - ./logs:/app/logs
     devices:
       - /dev/snd:/dev/snd # For audio access
