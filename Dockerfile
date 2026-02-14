@@ -21,7 +21,7 @@ COPY translators.py .
 COPY logger.py .
 
 # Create directories
-RUN mkdir -p /app/vosk_models /app/argos_models /app/logs
+RUN mkdir -p /app/vosk_models /app/argos_models /app/logs /app/fonts
 
 # Expose Gradio default port
 EXPOSE 7860
@@ -31,5 +31,4 @@ ENV GRADIO_SERVER_NAME="0.0.0.0"
 ENV GRADIO_SERVER_PORT="7860"
 
 # Run the application
-ENTRYPOINT ["python", "app.py"]
-CMD ["--host", "0.0.0.0", "--port", "7860"]
+CMD ["python", "app.py"]

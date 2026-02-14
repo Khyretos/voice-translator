@@ -50,6 +50,9 @@ vosk_models/
 # Argostranslate Models
 argos_models/
 
+# Fonts
+fonts/
+
 # Gradio
 gradio_cached_examples/
 flagged/

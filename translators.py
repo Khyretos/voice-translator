@@ -25,36 +25,9 @@ class TranslationService:
                 return self._translate_ai(text, source_lang, target_lang)
             elif mode == "libretranslate":
                 return self._translate_libretranslate(text, source_lang, target_lang)
-            else:  # internal
-                return self._translate_internal(text, source_lang, target_lang)
         except Exception as e:
             self.logger.log(f"Translation error ({mode}): {str(e)}", level="error")
             return f"[Translation error: {str(e)}]"
-
-    def _translate_internal(self, text: str, source_lang: str, target_lang: str) -> str:
-        """Translate using internal translators library"""
-        try:
-            if ts is None:
-                return "[translators library not installed]"
-
-            # Use Google Translate as default
-            result = ts.translate_text(
-                text,
-                translator="google",
-                from_language=source_lang,
-                to_language=target_lang,
-            )
-
-            self.logger.log(
-                f"Internal translation: '{text}' -> '{result}' ({source_lang}->{target_lang})",
-                level="info",
-            )
-
-            return result
-
-        except Exception as e:
-            self.logger.log(f"Internal translation error: {str(e)}", level="error")
-            raise
 
     def _translate_ai(self, text: str, source_lang: str, target_lang: str) -> str:
         """Translate using AI service (OpenAI-compatible)"""
