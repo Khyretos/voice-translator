@@ -21,7 +21,7 @@ COPY translators.py .
 COPY logger.py .
 
 # Create directories
-RUN mkdir -p /app/vosk_models /app/argos-models /app/logs
+RUN mkdir -p /app/vosk_models /app/argos_models /app/logs
 
 # Expose Gradio default port
 EXPOSE 7860
