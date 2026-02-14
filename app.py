@@ -18,7 +18,6 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from scipy import signal
 from vosk import KaldiRecognizer, Model
 
 from logger import Logger
@@ -239,14 +238,6 @@ def dots_or_stars(input_str: str, second_arg=None) -> bool:
     if input_str == "." or re.match(r"<\|.*|>", input_str):
         return True
     return False
-
-
-def resample_audio(audio, orig_sr, target_sr):
-    if orig_sr == target_sr:
-        return audio
-    number_of_samples = int(len(audio) * target_sr / orig_sr)
-    resampled = signal.resample(audio, number_of_samples)
-    return resampled.astype(audio.dtype)
 
 
 class ArgosTranslator:
