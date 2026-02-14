@@ -1,3 +1,7 @@
+# ⚠️ **AI ALERT**
+
+As a software developer with limited Python expertise, I directed the development of srt-translator by iteratively prompting AI language models (Claude and DeepSeek) to generate the majority of the code. Through systematic debugging, precise requirements, and continuous validation of the AI's output, I guided the project from concept to a fully functional application. This process demonstrates my ability to leverage AI tools effectively while retaining full ownership of problem‑solving and architectural decisions.
+
 # 🎤 Voice Translator - Real-time Speech Recognition & Translation
 
 A powerful, OBS-compatible voice recognition and translation app built with Python and Gradio. Supports multiple translation backends including AI models, offline Argos Translate, Whisper API, and LibreTranslate.
