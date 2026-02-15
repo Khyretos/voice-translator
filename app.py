@@ -232,6 +232,30 @@ window.stopBrowserStreaming = function() {
     }
     setStatus('Stopped');
 };
+
+// Notify server when tab is closed
+window.addEventListener('beforeunload', function() {
+    var sessionDiv = document.getElementById('session-data');
+    if (sessionDiv) {
+        var sessionHash = sessionDiv.dataset.session;
+        if (sessionHash) {
+            // Use sendBeacon to ensure the request is sent even during unload
+            navigator.sendBeacon('/close_session/' + sessionHash, '');
+        }
+    }
+});
+
+// Notify server when tab is actually closed (not on refresh)
+window.addEventListener('pagehide', function(event) {
+    var sessionDiv = document.getElementById('session-data');
+    if (sessionDiv) {
+        var sessionHash = sessionDiv.dataset.session;
+        if (sessionHash) {
+            navigator.sendBeacon('/deactivate/' + sessionHash, '');
+        }
+    }
+});
+
 </script>
 """
 
@@ -327,9 +351,27 @@ class ArgosTranslator:
 
 
 class WhisperRecognizer:
-    """Whisper API-based speech recognizer"""
+    """Whisper API-based speech recognizer with configurable parameters"""
 
-    def __init__(self, host, api_key=None, model="whisper-large-v3", logger=None):
+    def __init__(
+        self,
+        host,
+        api_key=None,
+        model="whisper-large-v3",
+        logger=None,
+        temperature=0.0,
+        best_of=5,
+        beam_size=5,
+        patience=1.0,
+        length_penalty=1.0,
+        suppress_tokens="-1",
+        initial_prompt=None,
+        condition_on_previous_text=True,
+        temperature_increment_on_fallback=0.2,
+        no_speech_threshold=0.6,
+        logprob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+    ):
         self.host = host.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -337,6 +379,41 @@ class WhisperRecognizer:
         self.session = requests.Session()
         if api_key:
             self.session.headers.update({"Authorization": f"Bearer {api_key}"})
+        # Store parameters
+        self.temperature = temperature
+        self.best_of = best_of
+        self.beam_size = beam_size
+        self.patience = patience
+        self.length_penalty = length_penalty
+        self.suppress_tokens = suppress_tokens
+        self.initial_prompt = initial_prompt
+        self.condition_on_previous_text = condition_on_previous_text
+        self.temperature_increment_on_fallback = temperature_increment_on_fallback
+        self.no_speech_threshold = no_speech_threshold
+        self.logprob_threshold = logprob_threshold
+        self.compression_ratio_threshold = compression_ratio_threshold
+
+    def _build_data(self, language=None, task="transcribe"):
+        data = {
+            "model": self.model,
+            "response_format": "json",
+            "temperature": self.temperature,
+            "best_of": self.best_of,
+            "beam_size": self.beam_size,
+            "patience": self.patience,
+            "length_penalty": self.length_penalty,
+            "suppress_tokens": self.suppress_tokens,
+            "condition_on_previous_text": self.condition_on_previous_text,
+            "temperature_increment_on_fallback": self.temperature_increment_on_fallback,
+            "no_speech_threshold": self.no_speech_threshold,
+            "logprob_threshold": self.logprob_threshold,
+            "compression_ratio_threshold": self.compression_ratio_threshold,
+        }
+        if language:
+            data["language"] = language
+        if self.initial_prompt:
+            data["prompt"] = self.initial_prompt
+        return data
 
     def transcribe(self, audio_bytes, sample_rate=16000, language=None):
         try:
@@ -358,9 +435,7 @@ class WhisperRecognizer:
             buffer.seek(0)
 
             files = {"file": ("audio.wav", buffer, "audio/wav")}
-            data = {"model": self.model, "response_format": "json", "temperature": 0.0}
-            if language:
-                data["language"] = language
+            data = self._build_data(language=language, task="transcribe")
 
             response = self.session.post(
                 f"{self.host}/audio/transcriptions", files=files, data=data, timeout=30
@@ -395,7 +470,7 @@ class WhisperRecognizer:
             buffer.seek(0)
 
             files = {"file": ("audio.wav", buffer, "audio/wav")}
-            data = {"model": self.model, "response_format": "json"}
+            data = self._build_data(task="translate")
 
             response = self.session.post(
                 f"{self.host}/audio/translations", files=files, data=data, timeout=30
@@ -420,6 +495,7 @@ class WhisperRecognizer:
 
 class VoiceTranslatorApp:
     def __init__(self, session_hash):
+        self.session_active = True
         self.display_running = True
         self.session_hash = session_hash
         self.popout_id = secrets.token_urlsafe(16)
@@ -443,6 +519,7 @@ class VoiceTranslatorApp:
         self.current_recognized = "Waiting for speech..."
         self.current_translated = ""
         self.last_update_time = time.time()
+        self.last_heartbeat = time.time()  # for session cleanup
 
         self.current_language = "en"
         self.available_vosk_models = {}
@@ -485,10 +562,36 @@ class VoiceTranslatorApp:
             "ai_model": "",
             "api_model": "",
             "mic_gain": 1.0,
-            # New settings
+            # Outline settings (separate for recognized and translated)
             "outline_width": 0,
             "outline_color": "#000000",
+            "translated_outline_width": 0,
+            "translated_outline_color": "#000000",
             "custom_font": "",
+            "whisper_temperature": 0.0,
+            "whisper_best_of": 5,
+            "whisper_beam_size": 5,
+            "whisper_patience": 1.0,
+            "whisper_length_penalty": 1.0,
+            "whisper_suppress_tokens": "-1",
+            "whisper_initial_prompt": "",
+            "whisper_condition_on_previous_text": True,
+            "whisper_temperature_increment_on_fallback": 0.2,
+            "whisper_no_speech_threshold": 0.6,
+            "whisper_logprob_threshold": -1.0,
+            "whisper_compression_ratio_threshold": 2.4,
+            "whisper_translate_temperature": 0.0,
+            "whisper_translate_best_of": 5,
+            "whisper_translate_beam_size": 5,
+            "whisper_translate_patience": 1.0,
+            "whisper_translate_length_penalty": 1.0,
+            "whisper_translate_suppress_tokens": "-1",
+            "whisper_translate_initial_prompt": "",
+            "whisper_translate_condition_on_previous_text": True,
+            "whisper_translate_temperature_increment_on_fallback": 0.2,
+            "whisper_translate_no_speech_threshold": 0.6,
+            "whisper_translate_logprob_threshold": -1.0,
+            "whisper_translate_compression_ratio_threshold": 2.4,
         }
 
         if ARGOS_AVAILABLE:
@@ -541,7 +644,7 @@ class VoiceTranslatorApp:
             self.logger.log(f"Filtered transcription (too long): {text}", level="debug")
             return False
 
-            # Reject repetitive garbage
+        # Reject repetitive garbage
         if self.is_repetitive_garbage(text):
             return False
 
@@ -648,6 +751,24 @@ class VoiceTranslatorApp:
                     api_key=self.settings.get("whisper_api_key"),
                     model=self.settings["whisper_model"],
                     logger=self.logger,
+                    temperature=self.settings["whisper_temperature"],
+                    best_of=self.settings["whisper_best_of"],
+                    beam_size=self.settings["whisper_beam_size"],
+                    patience=self.settings["whisper_patience"],
+                    length_penalty=self.settings["whisper_length_penalty"],
+                    suppress_tokens=self.settings["whisper_suppress_tokens"],
+                    initial_prompt=self.settings["whisper_initial_prompt"] or None,
+                    condition_on_previous_text=self.settings[
+                        "whisper_condition_on_previous_text"
+                    ],
+                    temperature_increment_on_fallback=self.settings[
+                        "whisper_temperature_increment_on_fallback"
+                    ],
+                    no_speech_threshold=self.settings["whisper_no_speech_threshold"],
+                    logprob_threshold=self.settings["whisper_logprob_threshold"],
+                    compression_ratio_threshold=self.settings[
+                        "whisper_compression_ratio_threshold"
+                    ],
                 )
                 self.recognizer = None
                 self.model = None
@@ -760,10 +881,16 @@ class VoiceTranslatorApp:
             transition: opacity 1s;
         """
 
-        # Outline style
-        outline_width = self.settings.get("outline_width", 0)
-        outline_color = self.settings.get("outline_color", "#000000")
-        outline_style = self._get_outline_css(outline_width, outline_color)
+        # Outline styles (separate for recognized and translated)
+        rec_outline_width = self.settings.get("outline_width", 0)
+        rec_outline_color = self.settings.get("outline_color", "#000000")
+        rec_outline_style = self._get_outline_css(rec_outline_width, rec_outline_color)
+
+        trans_outline_width = self.settings.get("translated_outline_width", 0)
+        trans_outline_color = self.settings.get("translated_outline_color", "#000000")
+        trans_outline_style = self._get_outline_css(
+            trans_outline_width, trans_outline_color
+        )
 
         # Font face for custom font (injected into the HTML)
         font_face = self._get_font_face_css()
@@ -775,10 +902,10 @@ class VoiceTranslatorApp:
             and translated_text
         ):
             texts.append(
-                f'<div style="font-size: {self.settings["translated_font_size"]}px; color: {self.settings["translated_color"]}; {base_style} {outline_style}">{translated_text}</div>'
+                f'<div style="font-size: {self.settings["translated_font_size"]}px; color: {self.settings["translated_color"]}; {base_style} {trans_outline_style}">{translated_text}</div>'
             )
         texts.append(
-            f'<div style="font-size: {self.settings["recognized_font_size"]}px; color: {self.settings["recognized_color"]}; {base_style} {outline_style}">{recognized_text}</div>'
+            f'<div style="font-size: {self.settings["recognized_font_size"]}px; color: {self.settings["recognized_color"]}; {base_style} {rec_outline_style}">{recognized_text}</div>'
         )
         if (
             self.settings["enable_translation"]
@@ -786,7 +913,7 @@ class VoiceTranslatorApp:
             and translated_text
         ):
             texts.append(
-                f'<div style="font-size: {self.settings["translated_font_size"]}px; color: {self.settings["translated_color"]}; {base_style} {outline_style}">{translated_text}</div>'
+                f'<div style="font-size: {self.settings["translated_font_size"]}px; color: {self.settings["translated_color"]}; {base_style} {trans_outline_style}">{translated_text}</div>'
             )
 
         # Wrap everything in a container with the font-face style if needed
@@ -800,16 +927,50 @@ class VoiceTranslatorApp:
                     break  # Exit on sentinel
                 if result_type == "final":
                     self.current_recognized = text
+                    # Clear old translation immediately
+                    self.current_translated = ""
                     if self.settings["enable_translation"]:
                         if (
                             self.settings.get("translation_mode") == "whisper"
                             and self.last_audio_chunk
                         ):
+                            # Create a new WhisperRecognizer for translation with its own parameters
                             wt = WhisperRecognizer(
                                 host=self.settings.get("whisper_translate_host"),
                                 api_key=self.settings.get("whisper_translate_api_key"),
                                 model=self.settings.get("whisper_translate_model"),
                                 logger=self.logger,
+                                temperature=self.settings[
+                                    "whisper_translate_temperature"
+                                ],
+                                best_of=self.settings["whisper_translate_best_of"],
+                                beam_size=self.settings["whisper_translate_beam_size"],
+                                patience=self.settings["whisper_translate_patience"],
+                                length_penalty=self.settings[
+                                    "whisper_translate_length_penalty"
+                                ],
+                                suppress_tokens=self.settings[
+                                    "whisper_translate_suppress_tokens"
+                                ],
+                                initial_prompt=self.settings[
+                                    "whisper_translate_initial_prompt"
+                                ]
+                                or None,
+                                condition_on_previous_text=self.settings[
+                                    "whisper_translate_condition_on_previous_text"
+                                ],
+                                temperature_increment_on_fallback=self.settings[
+                                    "whisper_translate_temperature_increment_on_fallback"
+                                ],
+                                no_speech_threshold=self.settings[
+                                    "whisper_translate_no_speech_threshold"
+                                ],
+                                logprob_threshold=self.settings[
+                                    "whisper_translate_logprob_threshold"
+                                ],
+                                compression_ratio_threshold=self.settings[
+                                    "whisper_translate_compression_ratio_threshold"
+                                ],
                             )
                             self.current_translated = wt.translate(
                                 self.last_audio_chunk
@@ -859,11 +1020,16 @@ class VoiceTranslatorApp:
     def generate_popout_html(self):
         alignment_map = {"left": "flex-start", "center": "center", "right": "flex-end"}
         fade_ms = int(self.settings.get("fade_timeout", 5.0) * 1000)
-        outline_width = self.settings.get("outline_width", 0)
-        outline_color = self.settings.get("outline_color", "#000000")
+        rec_outline_width = self.settings.get("outline_width", 0)
+        rec_outline_color = self.settings.get("outline_color", "#000000")
+        trans_outline_width = self.settings.get("translated_outline_width", 0)
+        trans_outline_color = self.settings.get("translated_outline_color", "#000000")
         font_face = self._get_font_face_css()
         font_family = self._get_font_family_css()
-        outline_style = self._get_outline_css(outline_width, outline_color)
+        rec_outline_style = self._get_outline_css(rec_outline_width, rec_outline_color)
+        trans_outline_style = self._get_outline_css(
+            trans_outline_width, trans_outline_color
+        )
 
         return f"""<!DOCTYPE html>
 <html><head><title>Display</title><meta charset="UTF-8">
@@ -872,8 +1038,8 @@ class VoiceTranslatorApp:
 body,html{{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden;background:{self.settings["background_color"]};display:flex;align-items:center;justify-content:{alignment_map[self.settings["text_alignment"]]}}}
 .container{{padding:20px;width:100%;text-align:{self.settings["text_alignment"]};transition:opacity 1s;opacity:1}}
 .container.fade{{opacity:0}}
-.rec{{font-size:{self.settings["recognized_font_size"]}px;color:{self.settings["recognized_color"]};margin:10px 0;font-family:{font_family};{outline_style}}}
-.tra{{font-size:{self.settings["translated_font_size"]}px;color:{self.settings["translated_color"]};margin:10px 0;font-family:{font_family};{outline_style}}}
+.rec{{font-size:{self.settings["recognized_font_size"]}px;color:{self.settings["recognized_color"]};margin:10px 0;font-family:{font_family};{rec_outline_style}}}
+.tra{{font-size:{self.settings["translated_font_size"]}px;color:{self.settings["translated_color"]};margin:10px 0;font-family:{font_family};{trans_outline_style}}}
 </style>
 <script>let t=null;function reset(){{const c=document.getElementById('c');c.classList.remove('fade');if(t)clearTimeout(t);t=setTimeout(()=>c.classList.add('fade'),{fade_ms})}}async function update(){{try{{const r=await fetch('/popout_data/{self.popout_id}');const d=await r.json();const e=document.getElementById('r');const n=d.recognized||"Waiting...";if(n!==e.textContent){{e.textContent=n;reset()}}document.getElementById('t').textContent=d.translated||""}}catch(e){{}}}}setInterval(update,500);document.addEventListener('DOMContentLoaded',()=>{{update();reset()}});</script>
 </head><body><div id="c" class="container"><div id="r" class="rec">Waiting...</div><div id="t" class="tra"></div></div></body></html>"""
@@ -968,6 +1134,11 @@ body,html{{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden;backgroun
 
         print(f"[SESSION CLEANUP] Completely closed session: {self.session_hash[:8]}")
 
+    def deactivate_session(self):
+        """Mark session as inactive and clean up resources."""
+        self.session_active = False
+        self.close()  # your existing close method
+
 
 def get_available_models():
     """Get available Vosk models"""
@@ -1006,12 +1177,33 @@ def get_or_create_app(session_hash):
         return SESSION_APPS[session_hash]
 
 
+def close_session(session_hash):
+    """Immediately close and remove a session."""
+    with SESSION_LOCK:
+        app = SESSION_APPS.pop(session_hash, None)
+        if app:
+            app.close()
+            print(f"[WS DISCONNECT] Closed session {session_hash[:8]}")
+
+
 def create_ui(args):
     with gr.Blocks(title="Voice Translator") as interface:
-        session_info = gr.Markdown("### Session initializing...")
+        with gr.Row():
+            with gr.Column(scale=1):
+                session_info = gr.Markdown("### Session initializing...")
+                gr.Markdown("# 🎤 Voice Translator")
+                browser_session_data = gr.HTML(visible=True)
+            with gr.Column(scale=1):
+                with gr.Group():
+                    session_dropdown = gr.Dropdown(
+                        label="Manage Sessions",
+                        choices=[],
+                        value=None,
+                        interactive=True,
+                        scale=4,
+                    )
+                    refresh_sessions_btn = gr.Button("🔄 Refresh", size="sm", scale=1)
 
-        gr.Markdown("# 🎤 Voice Translator")
-        browser_session_data = gr.HTML(visible=True)
         with gr.Row():
             with gr.Column(scale=1):
                 with gr.Accordion("🗣️ Speech Recognition", open=True):
@@ -1070,6 +1262,51 @@ def create_ui(args):
                             label="Language",
                             value="en",
                         )
+                        with gr.Accordion("Advanced Whisper Parameters", open=False):
+                            whisper_temperature = gr.Slider(
+                                0.0, 1.0, 0.0, step=0.1, label="Temperature"
+                            )
+                            whisper_best_of = gr.Slider(
+                                0, 10, 5, step=1, label="Best of"
+                            )
+                            whisper_beam_size = gr.Slider(
+                                0, 10, 5, step=1, label="Beam size"
+                            )
+                            whisper_patience = gr.Slider(
+                                0.0, 2.0, 1.0, step=0.1, label="Patience"
+                            )
+                            whisper_length_penalty = gr.Slider(
+                                0.0, 2.0, 1.0, step=0.1, label="Length penalty"
+                            )
+                            whisper_suppress_tokens = gr.Textbox(
+                                value="-1", label="Suppress tokens"
+                            )
+                            whisper_initial_prompt = gr.Textbox(
+                                label="Initial prompt", placeholder="Optional"
+                            )
+                            whisper_condition_on_previous_text = gr.Checkbox(
+                                value=True, label="Condition on previous text"
+                            )
+                            whisper_temperature_increment_on_fallback = gr.Slider(
+                                0.0,
+                                1.0,
+                                0.2,
+                                step=0.1,
+                                label="Temperature increment on fallback",
+                            )
+                            whisper_no_speech_threshold = gr.Slider(
+                                0.0, 1.0, 0.6, step=0.1, label="No speech threshold"
+                            )
+                            whisper_logprob_threshold = gr.Slider(
+                                -5.0, 0.0, -1.0, step=0.1, label="Logprob threshold"
+                            )
+                            whisper_compression_ratio_threshold = gr.Slider(
+                                0.0,
+                                5.0,
+                                2.4,
+                                step=0.1,
+                                label="Compression ratio threshold",
+                            )
                         test_whisper_btn = gr.Button("🔍 Test Connection", size="sm")
 
                 with gr.Accordion("🎙️ Audio", open=True):
@@ -1171,6 +1408,55 @@ def create_ui(args):
                             whisper_trans_model = gr.Textbox(
                                 label="Model", value="whisper-large-v3"
                             )
+                            with gr.Accordion(
+                                "Advanced Whisper Translate Parameters", open=False
+                            ):
+                                whisper_trans_temperature = gr.Slider(
+                                    0.0, 1.0, 0.0, step=0.1, label="Temperature"
+                                )
+                                whisper_trans_best_of = gr.Slider(
+                                    1, 10, 5, step=1, label="Best of"
+                                )
+                                whisper_trans_beam_size = gr.Slider(
+                                    1, 10, 5, step=1, label="Beam size"
+                                )
+                                whisper_trans_patience = gr.Slider(
+                                    0.0, 2.0, 1.0, step=0.1, label="Patience"
+                                )
+                                whisper_trans_length_penalty = gr.Slider(
+                                    0.0, 2.0, 1.0, step=0.1, label="Length penalty"
+                                )
+                                whisper_trans_suppress_tokens = gr.Textbox(
+                                    value="-1", label="Suppress tokens"
+                                )
+                                whisper_trans_initial_prompt = gr.Textbox(
+                                    label="Initial prompt", placeholder="Optional"
+                                )
+                                whisper_trans_condition_on_previous_text = gr.Checkbox(
+                                    value=True, label="Condition on previous text"
+                                )
+                                whisper_trans_temperature_increment_on_fallback = (
+                                    gr.Slider(
+                                        0.0,
+                                        1.0,
+                                        0.2,
+                                        step=0.1,
+                                        label="Temperature increment on fallback",
+                                    )
+                                )
+                                whisper_trans_no_speech_threshold = gr.Slider(
+                                    0.0, 1.0, 0.6, step=0.1, label="No speech threshold"
+                                )
+                                whisper_trans_logprob_threshold = gr.Slider(
+                                    -5.0, 0.0, -1.0, step=0.1, label="Logprob threshold"
+                                )
+                                whisper_trans_compression_ratio_threshold = gr.Slider(
+                                    0.0,
+                                    5.0,
+                                    2.4,
+                                    step=0.1,
+                                    label="Compression ratio threshold",
+                                )
                             gr.Markdown("*Translates audio to English using Whisper*")
 
                         # Argos translate settings
@@ -1295,13 +1581,43 @@ def create_ui(args):
                         interactive=True,
                     )
 
-                    gr.Markdown("**Text Outline**")
-                    outline_width = gr.Slider(
-                        0, 10, 0, step=1, label="Outline width (px)", interactive=True
-                    )
-                    outline_color = gr.ColorPicker(
-                        label="Outline color", value="#000000", interactive=True
-                    )
+                    with gr.Group():
+                        gr.Markdown("**Recognized Text Outline**")
+                        with gr.Row():
+                            with gr.Column(scale=3):
+                                outline_width = gr.Slider(
+                                    0,
+                                    10,
+                                    0,
+                                    step=1,
+                                    label="Outline width (px)",
+                                    interactive=True,
+                                )
+                            with gr.Column(scale=1):
+                                outline_color = gr.ColorPicker(
+                                    label="Outline color",
+                                    value="#000000",
+                                    interactive=True,
+                                )
+
+                    with gr.Group():
+                        gr.Markdown("**Translated Text Outline**")
+                        with gr.Row():
+                            with gr.Column(scale=3):
+                                translated_outline_width = gr.Slider(
+                                    0,
+                                    10,
+                                    0,
+                                    step=1,
+                                    label="Outline width (px)",
+                                    interactive=True,
+                                )
+                            with gr.Column(scale=1):
+                                translated_outline_color = gr.ColorPicker(
+                                    label="Outline color",
+                                    value="#000000",
+                                    interactive=True,
+                                )
 
         log_output = gr.Textbox(label="Log", lines=6)
 
@@ -1459,6 +1775,110 @@ def create_ui(args):
             app = get_or_create_app(request.session_hash)
             app.settings["whisper_language"] = value
 
+        # Whisper transcribe advanced parameter update functions
+        def update_whisper_temperature(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_temperature"] = value
+
+        def update_whisper_best_of(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_best_of"] = value
+
+        def update_whisper_beam_size(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_beam_size"] = value
+
+        def update_whisper_patience(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_patience"] = value
+
+        def update_whisper_length_penalty(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_length_penalty"] = value
+
+        def update_whisper_suppress_tokens(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_suppress_tokens"] = value
+
+        def update_whisper_initial_prompt(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_initial_prompt"] = value
+
+        def update_whisper_condition_on_previous_text(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_condition_on_previous_text"] = value
+
+        def update_whisper_temperature_increment_on_fallback(
+            value, request: gr.Request
+        ):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_temperature_increment_on_fallback"] = value
+
+        def update_whisper_no_speech_threshold(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_no_speech_threshold"] = value
+
+        def update_whisper_logprob_threshold(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_logprob_threshold"] = value
+
+        def update_whisper_compression_ratio_threshold(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_compression_ratio_threshold"] = value
+
+        # Whisper translate advanced parameter update functions
+        def update_whisper_trans_temperature(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_temperature"] = value
+
+        def update_whisper_trans_best_of(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_best_of"] = value
+
+        def update_whisper_trans_beam_size(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_beam_size"] = value
+
+        def update_whisper_trans_patience(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_patience"] = value
+
+        def update_whisper_trans_length_penalty(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_length_penalty"] = value
+
+        def update_whisper_trans_suppress_tokens(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_suppress_tokens"] = value
+
+        def update_whisper_trans_initial_prompt(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_initial_prompt"] = value
+
+        def update_whisper_trans_condition_on_previous_text(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_condition_on_previous_text"] = value
+
+        def update_whisper_trans_temperature_increment_on_fallback(
+            value, request: gr.Request
+        ):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_temperature_increment_on_fallback"] = value
+
+        def update_whisper_trans_no_speech_threshold(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_no_speech_threshold"] = value
+
+        def update_whisper_trans_logprob_threshold(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_logprob_threshold"] = value
+
+        def update_whisper_trans_compression_ratio_threshold(
+            value, request: gr.Request
+        ):
+            app = get_or_create_app(request.session_hash)
+            app.settings["whisper_translate_compression_ratio_threshold"] = value
+
         def update_whisper_trans_host(value, request: gr.Request):
             app = get_or_create_app(request.session_hash)
             app.settings["whisper_translate_host"] = value
@@ -1515,7 +1935,7 @@ def create_ui(args):
                 app.popout_id,
             )
 
-        # New update functions
+        # New update functions for outlines
         def update_outline_width(value, request: gr.Request):
             app = get_or_create_app(request.session_hash)
             app.settings["outline_width"] = value
@@ -1523,6 +1943,77 @@ def create_ui(args):
         def update_outline_color(value, request: gr.Request):
             app = get_or_create_app(request.session_hash)
             app.settings["outline_color"] = value
+
+        def update_translated_outline_width(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["translated_outline_width"] = value
+
+        def update_translated_outline_color(value, request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            app.settings["translated_outline_color"] = value
+
+        def handle_session_action(action, request: gr.Request):
+            if action == "Close this session":
+                with SESSION_LOCK:
+                    app = SESSION_APPS.get(request.session_hash)
+                    if app:
+                        app.deactivate_session()
+                        del SESSION_APPS[request.session_hash]
+                return "Session closed", gr.update(value="Select action")
+            elif action == "Close all sessions":
+                with SESSION_LOCK:
+                    for h, app in list(SESSION_APPS.items()):
+                        app.deactivate_session()
+                        del SESSION_APPS[h]
+                return "All sessions closed", gr.update(value="Select action")
+            return "", gr.update()
+
+        def refresh_sessions_list(request: gr.Request):
+            current = request.session_hash
+            try:
+                base_url = f"http://{args.host}:{args.port}"
+                response = requests.get(f"{base_url}/active_sessions", timeout=2)
+                if response.status_code == 200:
+                    sessions = response.json().get("sessions", [])
+                    other_sessions = [s for s in sessions if s != current]
+                    total_active = len(sessions)
+                    choices = [("All sessions", "ALL")] + [
+                        (s[:8], s) for s in other_sessions
+                    ]
+                    dropdown_update = gr.update(choices=choices, value=None)
+                    info_update = gr.update(
+                        value=f"### 🎯 Session: `{current[:8]}` | Active: {total_active}"
+                    )
+                    return dropdown_update, info_update
+            except Exception as e:
+                print(f"Error refreshing sessions: {e}")
+            return gr.update(choices=[]), gr.update()
+
+        def close_session_action(selected, request: gr.Request):
+            current = request.session_hash
+            if not selected:
+                return "No session selected", gr.update()
+            if selected == "ALL":
+                with SESSION_LOCK:
+                    for h, app in list(SESSION_APPS.items()):
+                        if h != current:
+                            app.deactivate_session()
+                            del SESSION_APPS[h]
+                    total_active = len(SESSION_APPS)  # includes current
+                message = "All other sessions closed"
+            else:
+                # selected is a session hash
+                with SESSION_LOCK:
+                    app = SESSION_APPS.get(selected)
+                    if app:
+                        app.deactivate_session()
+                        del SESSION_APPS[selected]
+                    total_active = len(SESSION_APPS)
+                message = f"Session {selected[:8]} closed"
+            info_update = gr.update(
+                value=f"### 🎯 Session: `{current[:8]}` | Active: {total_active}"
+            )
+            return message, info_update
 
         def start_rec(request: gr.Request):
             app = get_or_create_app(request.session_hash)
@@ -1659,9 +2150,55 @@ def create_ui(args):
                 whisper_api_key: settings["whisper_api_key"],
                 whisper_model: settings["whisper_model"],
                 whisper_language: settings["whisper_language"],
+                whisper_temperature: settings["whisper_temperature"],
+                whisper_best_of: settings["whisper_best_of"],
+                whisper_beam_size: settings["whisper_beam_size"],
+                whisper_patience: settings["whisper_patience"],
+                whisper_length_penalty: settings["whisper_length_penalty"],
+                whisper_suppress_tokens: settings["whisper_suppress_tokens"],
+                whisper_initial_prompt: settings["whisper_initial_prompt"],
+                whisper_condition_on_previous_text: settings[
+                    "whisper_condition_on_previous_text"
+                ],
+                whisper_temperature_increment_on_fallback: settings[
+                    "whisper_temperature_increment_on_fallback"
+                ],
+                whisper_no_speech_threshold: settings["whisper_no_speech_threshold"],
+                whisper_logprob_threshold: settings["whisper_logprob_threshold"],
+                whisper_compression_ratio_threshold: settings[
+                    "whisper_compression_ratio_threshold"
+                ],
                 whisper_trans_host: settings["whisper_translate_host"],
                 whisper_trans_api_key: settings["whisper_translate_api_key"],
                 whisper_trans_model: settings["whisper_translate_model"],
+                whisper_trans_temperature: settings["whisper_translate_temperature"],
+                whisper_trans_best_of: settings["whisper_translate_best_of"],
+                whisper_trans_beam_size: settings["whisper_translate_beam_size"],
+                whisper_trans_patience: settings["whisper_translate_patience"],
+                whisper_trans_length_penalty: settings[
+                    "whisper_translate_length_penalty"
+                ],
+                whisper_trans_suppress_tokens: settings[
+                    "whisper_translate_suppress_tokens"
+                ],
+                whisper_trans_initial_prompt: settings[
+                    "whisper_translate_initial_prompt"
+                ],
+                whisper_trans_condition_on_previous_text: settings[
+                    "whisper_translate_condition_on_previous_text"
+                ],
+                whisper_trans_temperature_increment_on_fallback: settings[
+                    "whisper_translate_temperature_increment_on_fallback"
+                ],
+                whisper_trans_no_speech_threshold: settings[
+                    "whisper_translate_no_speech_threshold"
+                ],
+                whisper_trans_logprob_threshold: settings[
+                    "whisper_translate_logprob_threshold"
+                ],
+                whisper_trans_compression_ratio_threshold: settings[
+                    "whisper_translate_compression_ratio_threshold"
+                ],
                 argos_source: settings["argos_source_lang"],
                 argos_target: settings["argos_target_lang"],
                 fade_timeout: settings["fade_timeout"],
@@ -1673,9 +2210,12 @@ def create_ui(args):
                 mic_gain: settings["mic_gain"],
                 outline_width: settings["outline_width"],
                 outline_color: settings["outline_color"],
+                translated_outline_width: settings["translated_outline_width"],
+                translated_outline_color: settings["translated_outline_color"],
                 browser_session_data: session_html,
                 browser_status: "Ready",
                 custom_popout_id: app.popout_id,
+                session_dropdown: gr.update(choices=[]),  # will be refreshed after load
             }
 
         # Wire up events
@@ -1741,6 +2281,82 @@ def create_ui(args):
             update_whisper_trans_api_key, [whisper_trans_api_key]
         )
         whisper_trans_model.change(update_whisper_trans_model, [whisper_trans_model])
+
+        # Whisper transcribe advanced parameter events
+        whisper_temperature.change(update_whisper_temperature, [whisper_temperature])
+        whisper_best_of.change(update_whisper_best_of, [whisper_best_of])
+        whisper_beam_size.change(update_whisper_beam_size, [whisper_beam_size])
+        whisper_patience.change(update_whisper_patience, [whisper_patience])
+        whisper_length_penalty.change(
+            update_whisper_length_penalty, [whisper_length_penalty]
+        )
+        whisper_suppress_tokens.change(
+            update_whisper_suppress_tokens, [whisper_suppress_tokens]
+        )
+        whisper_initial_prompt.change(
+            update_whisper_initial_prompt, [whisper_initial_prompt]
+        )
+        whisper_condition_on_previous_text.change(
+            update_whisper_condition_on_previous_text,
+            [whisper_condition_on_previous_text],
+        )
+        whisper_temperature_increment_on_fallback.change(
+            update_whisper_temperature_increment_on_fallback,
+            [whisper_temperature_increment_on_fallback],
+        )
+        whisper_no_speech_threshold.change(
+            update_whisper_no_speech_threshold, [whisper_no_speech_threshold]
+        )
+        whisper_logprob_threshold.change(
+            update_whisper_logprob_threshold, [whisper_logprob_threshold]
+        )
+        whisper_compression_ratio_threshold.change(
+            update_whisper_compression_ratio_threshold,
+            [whisper_compression_ratio_threshold],
+        )
+
+        # Whisper translate advanced parameter events
+        whisper_trans_temperature.change(
+            update_whisper_trans_temperature, [whisper_trans_temperature]
+        )
+        whisper_trans_best_of.change(
+            update_whisper_trans_best_of, [whisper_trans_best_of]
+        )
+        whisper_trans_beam_size.change(
+            update_whisper_trans_beam_size, [whisper_trans_beam_size]
+        )
+        whisper_trans_patience.change(
+            update_whisper_trans_patience, [whisper_trans_patience]
+        )
+        whisper_trans_length_penalty.change(
+            update_whisper_trans_length_penalty, [whisper_trans_length_penalty]
+        )
+        whisper_trans_suppress_tokens.change(
+            update_whisper_trans_suppress_tokens, [whisper_trans_suppress_tokens]
+        )
+        whisper_trans_initial_prompt.change(
+            update_whisper_trans_initial_prompt, [whisper_trans_initial_prompt]
+        )
+        whisper_trans_condition_on_previous_text.change(
+            update_whisper_trans_condition_on_previous_text,
+            [whisper_trans_condition_on_previous_text],
+        )
+        whisper_trans_temperature_increment_on_fallback.change(
+            update_whisper_trans_temperature_increment_on_fallback,
+            [whisper_trans_temperature_increment_on_fallback],
+        )
+        whisper_trans_no_speech_threshold.change(
+            update_whisper_trans_no_speech_threshold,
+            [whisper_trans_no_speech_threshold],
+        )
+        whisper_trans_logprob_threshold.change(
+            update_whisper_trans_logprob_threshold, [whisper_trans_logprob_threshold]
+        )
+        whisper_trans_compression_ratio_threshold.change(
+            update_whisper_trans_compression_ratio_threshold,
+            [whisper_trans_compression_ratio_threshold],
+        )
+
         argos_source.change(update_argos_source, [argos_source])
         argos_target.change(update_argos_target, [argos_target])
         fade_timeout.change(update_fade_timeout, [fade_timeout])
@@ -1749,6 +2365,20 @@ def create_ui(args):
 
         outline_width.change(update_outline_width, [outline_width])
         outline_color.change(update_outline_color, [outline_color])
+        translated_outline_width.change(
+            update_translated_outline_width, [translated_outline_width]
+        )
+        translated_outline_color.change(
+            update_translated_outline_color, [translated_outline_color]
+        )
+
+        refresh_sessions_btn.click(
+            refresh_sessions_list, outputs=[session_dropdown, session_info]
+        )
+
+        session_dropdown.change(
+            close_session_action, [session_dropdown], [status_text, session_info]
+        ).then(refresh_sessions_list, outputs=[session_dropdown, session_info])
 
         refresh_fonts_btn.click(
             lambda: gr.update(choices=SYSTEM_FONTS + get_available_fonts()),
@@ -1818,9 +2448,33 @@ def create_ui(args):
                 whisper_api_key,
                 whisper_model,
                 whisper_language,
+                whisper_temperature,
+                whisper_best_of,
+                whisper_beam_size,
+                whisper_patience,
+                whisper_length_penalty,
+                whisper_suppress_tokens,
+                whisper_initial_prompt,
+                whisper_condition_on_previous_text,
+                whisper_temperature_increment_on_fallback,
+                whisper_no_speech_threshold,
+                whisper_logprob_threshold,
+                whisper_compression_ratio_threshold,
                 whisper_trans_host,
                 whisper_trans_api_key,
                 whisper_trans_model,
+                whisper_trans_temperature,
+                whisper_trans_best_of,
+                whisper_trans_beam_size,
+                whisper_trans_patience,
+                whisper_trans_length_penalty,
+                whisper_trans_suppress_tokens,
+                whisper_trans_initial_prompt,
+                whisper_trans_condition_on_previous_text,
+                whisper_trans_temperature_increment_on_fallback,
+                whisper_trans_no_speech_threshold,
+                whisper_trans_logprob_threshold,
+                whisper_trans_compression_ratio_threshold,
                 argos_source,
                 argos_target,
                 fade_timeout,
@@ -1832,9 +2486,12 @@ def create_ui(args):
                 mic_gain,
                 outline_width,
                 outline_color,
+                translated_outline_width,
+                translated_outline_color,
                 browser_session_data,
                 browser_status,
                 custom_popout_id,
+                session_dropdown,
             ],
         )
 
@@ -1878,37 +2535,11 @@ LOG_CONFIG = {
     },
 }
 
-
-def cleanup_old_sessions(timeout_minutes=1):
-    """Periodically clean up old sessions"""
-    while True:
-        time.sleep(300)  # Run every 5 minutes
-        current_time = time.time()
-        with SESSION_LOCK:
-            sessions_to_remove = []
-
-            for session_hash, app in SESSION_APPS.items():
-                # Check if session hasn't been updated for timeout period
-                time_since_last_update = current_time - app.last_update_time
-                if time_since_last_update > (timeout_minutes * 60):
-                    sessions_to_remove.append(session_hash)
-
-            for session_hash in sessions_to_remove:
-                app = SESSION_APPS[session_hash]
-                app.close()
-                del SESSION_APPS[session_hash]
-                print(f"[AUTO CLEANUP] Removed inactive session {session_hash[:8]}")
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
-
-    # Start session cleanup thread
-    cleanup_thread = threading.Thread(target=cleanup_old_sessions, daemon=True)
-    cleanup_thread.start()
 
     args = parser.parse_args()
 
@@ -1922,6 +2553,35 @@ if __name__ == "__main__":
         allow_headers=["*"],
     )
 
+    @fastapi_app.get("/active_sessions")
+    async def get_active_sessions():
+        with SESSION_LOCK:
+            # Return list of all session hashes
+            sessions = list(SESSION_APPS.keys())
+            return JSONResponse({"sessions": sessions})
+
+    @fastapi_app.post("/deactivate/{session_hash}")
+    async def deactivate_session(session_hash: str):
+        """Deactivate and close a session (called by browser on tab close)."""
+        with SESSION_LOCK:
+            app = SESSION_APPS.get(session_hash)
+            if app:
+                app.deactivate_session()
+                # Remove from global storage
+                del SESSION_APPS[session_hash]
+                return JSONResponse({"status": "deactivated"})
+        return JSONResponse({"status": "not found"}, status_code=404)
+
+    @fastapi_app.post("/close_session/{session_hash}")
+    async def close_session_endpoint(session_hash: str):
+        """Immediately close and remove a session (called by browser on tab close)."""
+        with SESSION_LOCK:
+            app = SESSION_APPS.pop(session_hash, None)
+            if app:
+                app.close()
+                return JSONResponse({"status": "closed"})
+        return JSONResponse({"status": "not found"}, status_code=404)
+
     @fastapi_app.websocket("/ws/{session_hash}")
     async def websocket_endpoint(websocket: WebSocket, session_hash: str):
         await websocket.accept()
@@ -1932,13 +2592,22 @@ if __name__ == "__main__":
             return
         try:
             while True:
-                data = await websocket.receive_bytes()
-                # Data is expected to be raw PCM int16, mono, 16kHz
-                app.audio_queue.put(data)
+                message = await websocket.receive()
+                if message["type"] == "websocket.receive":
+                    if "text" in message:
+                        data = json.loads(message["text"])
+                        if data.get("type") == "heartbeat":
+                            # Optional: you can still update a last_heartbeat if you want, but not needed for cleanup
+                            pass
+                    elif "bytes" in message:
+                        # Audio data
+                        app.audio_queue.put(message["bytes"])
         except WebSocketDisconnect:
-            pass
+            # Client disconnected (tab closed)
+            close_session(session_hash)
         except Exception as e:
             print(f"WebSocket error for session {session_hash}: {e}")
+            close_session(session_hash)
 
     @fastapi_app.get("/popout/{popout_id}")
     async def get_popout(popout_id: str):
@@ -1983,7 +2652,8 @@ if __name__ == "__main__":
 ║  ✨ Each tab/refresh = new independent session              ║
 ║  🎙️ Browser mode uses Web Audio API + WebSocket             ║
 ║  🎨 Added text outline & custom font support                ║
-║  🔒 Thread-safe session management                           ║
+║  🔧 Whisper parameters fully configurable                   ║
+║  🔒 Thread-safe session management (heartbeat-based)        ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
 
