@@ -69,3 +69,4 @@ flagged/
 *.tmp
 *.temp
 .cache/
+.mypy_cache

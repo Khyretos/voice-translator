@@ -233,19 +233,7 @@ window.stopBrowserStreaming = function() {
     setStatus('Stopped');
 };
 
-// Notify server when tab is closed
-window.addEventListener('beforeunload', function() {
-    var sessionDiv = document.getElementById('session-data');
-    if (sessionDiv) {
-        var sessionHash = sessionDiv.dataset.session;
-        if (sessionHash) {
-            // Use sendBeacon to ensure the request is sent even during unload
-            navigator.sendBeacon('/close_session/' + sessionHash, '');
-        }
-    }
-});
-
-// Notify server when tab is actually closed (not on refresh)
+// Notify server when tab is closed (using sendBeacon)
 window.addEventListener('pagehide', function(event) {
     var sessionDiv = document.getElementById('session-data');
     if (sessionDiv) {
@@ -255,7 +243,6 @@ window.addEventListener('pagehide', function(event) {
         }
     }
 });
-
 </script>
 """
 
@@ -518,8 +505,7 @@ class VoiceTranslatorApp:
 
         self.current_recognized = "Waiting for speech..."
         self.current_translated = ""
-        self.last_update_time = time.time()
-        self.last_heartbeat = time.time()  # for session cleanup
+        self.last_update_time = time.time()  # last speech activity (final or interim)
 
         self.current_language = "en"
         self.available_vosk_models = {}
@@ -1183,7 +1169,23 @@ def close_session(session_hash):
         app = SESSION_APPS.pop(session_hash, None)
         if app:
             app.close()
-            print(f"[WS DISCONNECT] Closed session {session_hash[:8]}")
+            print(f"[SESSION CLOSED] {session_hash[:8]}")
+
+
+def cleanup_inactive_sessions(timeout_hours=1):
+    """Background thread: close sessions with no speech activity for > timeout_hours."""
+    while True:
+        time.sleep(300)  # check every 5 minutes
+        now = time.time()
+        with SESSION_LOCK:
+            to_remove = []
+            for h, app in SESSION_APPS.items():
+                if now - app.last_update_time > timeout_hours * 3600:
+                    to_remove.append(h)
+            for h in to_remove:
+                app = SESSION_APPS.pop(h)
+                app.close()
+                print(f"[INACTIVE CLEANUP] Closed session {h[:8]}")
 
 
 def create_ui(args):
@@ -2540,11 +2542,15 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
-
     args = parser.parse_args()
 
-    fastapi_app = FastAPI()
+    # Start inactive session cleanup thread
+    cleanup_thread = threading.Thread(
+        target=cleanup_inactive_sessions, args=(1,), daemon=True
+    )
+    cleanup_thread.start()
 
+    fastapi_app = FastAPI()
     fastapi_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -2556,30 +2562,16 @@ if __name__ == "__main__":
     @fastapi_app.get("/active_sessions")
     async def get_active_sessions():
         with SESSION_LOCK:
-            # Return list of all session hashes
-            sessions = list(SESSION_APPS.keys())
-            return JSONResponse({"sessions": sessions})
+            return JSONResponse({"sessions": list(SESSION_APPS.keys())})
 
     @fastapi_app.post("/deactivate/{session_hash}")
     async def deactivate_session(session_hash: str):
-        """Deactivate and close a session (called by browser on tab close)."""
         with SESSION_LOCK:
             app = SESSION_APPS.get(session_hash)
             if app:
                 app.deactivate_session()
-                # Remove from global storage
                 del SESSION_APPS[session_hash]
                 return JSONResponse({"status": "deactivated"})
-        return JSONResponse({"status": "not found"}, status_code=404)
-
-    @fastapi_app.post("/close_session/{session_hash}")
-    async def close_session_endpoint(session_hash: str):
-        """Immediately close and remove a session (called by browser on tab close)."""
-        with SESSION_LOCK:
-            app = SESSION_APPS.pop(session_hash, None)
-            if app:
-                app.close()
-                return JSONResponse({"status": "closed"})
         return JSONResponse({"status": "not found"}, status_code=404)
 
     @fastapi_app.websocket("/ws/{session_hash}")
@@ -2594,16 +2586,11 @@ if __name__ == "__main__":
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.receive":
-                    if "text" in message:
-                        data = json.loads(message["text"])
-                        if data.get("type") == "heartbeat":
-                            # Optional: you can still update a last_heartbeat if you want, but not needed for cleanup
-                            pass
-                    elif "bytes" in message:
+                    if "bytes" in message:
                         # Audio data
                         app.audio_queue.put(message["bytes"])
+                    # Ignore any text messages (no heartbeats used)
         except WebSocketDisconnect:
-            # Client disconnected (tab closed)
             close_session(session_hash)
         except Exception as e:
             print(f"WebSocket error for session {session_hash}: {e}")
@@ -2653,7 +2640,8 @@ if __name__ == "__main__":
 ║  🎙️ Browser mode uses Web Audio API + WebSocket             ║
 ║  🎨 Added text outline & custom font support                ║
 ║  🔧 Whisper parameters fully configurable                   ║
-║  🔒 Thread-safe session management (heartbeat-based)        ║
+║  🔒 Thread-safe session management                           ║
+║  🧹 Inactive sessions cleaned after 1 hour                   ║
 ╚══════════════════════════════════════════════════════════════╝
     """)
 
