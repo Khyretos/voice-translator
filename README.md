@@ -17,6 +17,7 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
   - **Whisper Translate** – direct audio translation via Whisper API
   - **LibreTranslate** – self‑hosted or cloud translation service
   - **Internal translation** – using `translators` library (Google Translate, etc.)
+  - **Moonshine** – lightweight ONNX‑based local ASR. Auto‑downloads models from HuggingFace. Supports 8+ languages.
 - **Independent Session Management** – each browser tab runs its own isolated session
 - **Pop‑out Display** – separate window for OBS overlay, updates via polling
 - **Interim Results** – show partial recognition as you speak
@@ -42,7 +43,9 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 
 ## Screenshots
 
-### Speech recognition
+#### Session Management
+
+![alt text](./images/image-5.png)
 
 #### Vosk
 
@@ -52,34 +55,43 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 
 ![alt text](./images/image.png)
 
-### Audio options
-
-#### Hardware
+#### Moonshine
 
 ![alt text](./images/image-2.png)
+
+### Mic options
+
+![alt text](./images/image-3.png)
 
 ### Translation
 
 #### Argos
 
-![alt text](./images/image-3.png)
+![alt text](./images/image-9.png)
 
 #### AI
 
-![alt text](./images/image-4.png)
+![alt text](./images/image-10.png)
 
 #### Libretranslate
 
-![alt text](./images/image-5.png)
+![alt text](./images/image-11.png)
 
 #### Whisper translate
 
+![alt text](./images/image-4.png)
+
+### Display
+
 ![alt text](./images/image-6.png)
 
-### Display style
+### Display Style
 
 ![alt text](./images/image-7.png)
-![alt text](./images/image-10.png)
+
+### Subtitle Timing
+
+![alt text](./images/image-8.png)
 
 ## 📋 Requirements
 
@@ -183,6 +195,39 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 
 4. Access the application at `http://localhost:7860`
 
+### Docker – Additional Notes
+
+- **Building the image** requires internet access to download `gcc` and Python headers inside the container. This is handled automatically by the improved Dockerfile below.
+- **Audio access** on Linux requires the `--device /dev/snd` flag (already in `docker-compose.yml`). On macOS/Windows, Docker Desktop may have limited audio support; use browser audio mode instead.
+- **Moonshine (local ONNX model)** – If you want to use Moonshine, add `moonshine-voice` to `requirements.txt` (or install it inside the container). The default Dockerfile does **not** include it to keep the image smaller.
+- **Volume mounts** – The compose file mounts `./vosk_models`, `./argos_models`, `./fonts`, and `./logs`. Create these directories on your host before starting the container.
+- **Fix for docker‑compose command** – Use the corrected `command` shown below, otherwise the container will not start.
+
+### `docker-compose.yml`
+
+```yaml
+version: "3.8"
+
+services:
+  voice-translator:
+    build: .
+    container_name: voice-translator
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./vosk_models:/app/vosk_models
+      - ./argos_models:/app/argos_models
+      - ./fonts:/app/fonts
+      - ./logs:/app/logs
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+    restart: unless-stopped
+    command: python app.py --host 0.0.0.0 --port 7860
+```
+
 ## 🎮 Usage
 
 ### Basic Setup
@@ -244,6 +289,48 @@ Translation Mode: libretranslate
 LibreTranslate Host: http://localhost:5000
 (API key if required)
 ```
+
+### 🎚️ Voice Activity Detection (VAD)
+
+Adjust when the app detects speech:
+
+- **Threshold (dB)** – sensitivity. Lower values (‑60) detect whispers, higher (‑10) only loud speech.
+- **End‑of‑speech pause** – how long silence waits before sending a segment. Increase (500‑800 ms) if phrases are cut off.
+- **Noise filter** – removes clicks, keyboard, and background hum. 0 = off, 1 = aggressive (may soften speech).
+
+### 📺 Subtitle Display Modes
+
+- **Instant** – text appears immediately, fades after timeout.
+- **Buffered (paced)** – sentences queue up and are shown in chunks. Each chunk stays on screen long enough to read at the chosen **characters per second** (CPS). Ideal for fast speakers or Whisper (which sends whole phrases).
+
+### ✍️ Text Outline
+
+Add a stroke around recognized and translated text. Useful for better readability on bright backgrounds. Set width (pixels) and color.
+
+### 🔤 Custom Fonts
+
+Place `.ttf`, `.otf`, `.woff`, or `.woff2` files in the `fonts/` directory (created automatically). They appear in the font dropdown as `[Custom] fontname`.
+
+### 🎙️ Microphone Test
+
+Before starting recognition, click **Test Mic** (hardware mode) or **Test Mic** (browser mode) to see the level meter without transcribing. Useful to check if your mic works and to set the VAD threshold.
+
+### 👥 Multi‑Session Management
+
+Each browser tab runs an independent session. Use the **Manage Sessions** dropdown to close other sessions and free resources.
+
+### 🔗 Pop‑out Custom ID
+
+By default, the pop‑out URL uses a random ID. You can enter a custom ID (letters, numbers, underscores, hyphens) to get a persistent URL, e.g., `http://localhost:7860/popout/my_stream`.
+
+### 🐳 Docker Audio Passthrough
+
+- **Linux**: Hardware microphone works via `/dev/snd` passthrough (already configured in `docker-compose.yml`).
+- **macOS / Windows**: Docker Desktop does not support `/dev/snd`. Use **browser audio mode** instead – it works perfectly without host sound device access.
+
+### 🤖 Whisper Advanced Parameters
+
+Expand the **Advanced Whisper Parameters** accordion to fine‑tune transcription (temperature, beam size, no‑speech threshold, etc.). See [OpenAI Whisper API docs](https://platform.openai.com/docs/api-reference/audio/createTranscription) for details.
 
 ### Display Customization
 

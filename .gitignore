@@ -50,6 +50,9 @@ vosk_models/
 # Argostranslate Models
 argos_models/
 
+# Moonshine Models
+moonshine_models/
+
 # Fonts
 fonts/
 
@@ -70,3 +73,5 @@ flagged/
 *.temp
 .cache/
 .mypy_cache
+
+settings.json

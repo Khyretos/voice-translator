@@ -1,34 +1,34 @@
 FROM python:3.11-slim
 
-# Install system dependencies
+# Install system dependencies + build tools (required for webrtcvad)
 RUN apt-get update && apt-get install -y \
     portaudio19-dev \
     python3-pyaudio \
     ffmpeg \
     libsndfile1 \
+    build-essential \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
-COPY app.py .
-COPY translators.py .
-COPY logger.py .
+# Remove build tools to slim down the image
+RUN apt-get remove -y build-essential python3-dev && apt-get autoremove -y
 
-# Create directories
+# Copy application files (multiple sources -> destination must end with /)
+COPY app.py translators.py logger.py ./
+
+# Create required directories
 RUN mkdir -p /app/vosk_models /app/argos_models /app/logs /app/fonts
 
-# Expose Gradio default port
 EXPOSE 7860
 
-# Set environment variables
 ENV GRADIO_SERVER_NAME="0.0.0.0"
 ENV GRADIO_SERVER_PORT="7860"
 
-# Run the application
-CMD ["python", "app.py"]
+# Run the application with host/port arguments
+CMD ["python", "voice_translator.py", "--host", "0.0.0.0", "--port", "7860"]

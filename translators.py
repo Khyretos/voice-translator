@@ -87,54 +87,56 @@ class TranslationService:
             self.logger.log(f"AI API response parsing error: {str(e)}", level="error")
             raise
 
-    def _translate_libretranslate(
-        self, text: str, source_lang: str, target_lang: str
-    ) -> str:
+    def _translate_libretranslate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Translate using LibreTranslate service"""
         try:
+            # Normalize language codes: "en-US" -> "en", "es-ES" -> "es", etc.
+            src = source_lang.split('-')[0] if source_lang else "auto"
+            tgt = target_lang.split('-')[0] if target_lang else "en"
+
             host = self.settings.get("libretranslate_host", "http://localhost:5000")
             api_key = self.settings.get("libretranslate_api_key", "")
 
-            # Ensure host has correct endpoint
-            if not host.endswith("/translate"):
-                if host.endswith("/"):
-                    host = f"{host}translate"
-                else:
-                    host = f"{host}/translate"
+            # Build URL: ensure it ends with /translate
+            base = host.rstrip('/')
+            if not base.endswith('/translate'):
+                url = f"{base}/translate"
+            else:
+                url = base
 
             payload = {
                 "q": text,
-                "source": source_lang,
-                "target": target_lang,
-                "format": "text",
+                "source": src,
+                "target": tgt,
+                "format": "text"
             }
-
             if api_key:
                 payload["api_key"] = api_key
 
-            self.logger.log(f"LibreTranslate request to {host}", level="info")
+            self.logger.log(f"LibreTranslate request to {url} ({src}->{tgt})", level="info")
 
-            response = requests.post(host, json=payload, timeout=10)
-
+            response = requests.post(url, json=payload, timeout=10)
             response.raise_for_status()
             result = response.json()
 
             translated_text = result.get("translatedText", "")
 
-            self.logger.log(
-                f"LibreTranslate translation: '{text}' -> '{translated_text}' ({source_lang}->{target_lang})",
-                level="info",
-            )
+            if not translated_text:
+                self.logger.log("LibreTranslate returned empty translation", level="warning")
+                return ""
 
+            self.logger.log(
+                f"LibreTranslate: '{text}' -> '{translated_text}' ({src}->{tgt})",
+                level="info"
+            )
             return translated_text
 
-        except requests.exceptions.RequestException as e:
-            self.logger.log(
-                f"LibreTranslate API request error: {str(e)}", level="error"
-            )
-            raise
-        except (KeyError, ValueError) as e:
-            self.logger.log(
-                f"LibreTranslate API response parsing error: {str(e)}", level="error"
-            )
+        except requests.exceptions.ConnectionError:
+            self.logger.log("LibreTranslate connection error - is the server running?", level="error")
+            return f"[LibreTranslate not reachable at {host}]"
+        except requests.exceptions.Timeout:
+            self.logger.log("LibreTranslate request timed out", level="error")
+            return "[LibreTranslate timeout]"
+        except Exception as e:
+            self.logger.log(f"LibreTranslate error: {str(e)}", level="error")
             raise
