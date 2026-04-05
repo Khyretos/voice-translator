@@ -2123,7 +2123,7 @@ class VoiceTranslatorApp:
             f'if(t)clearTimeout(t);t=setTimeout(()=>c.classList.add("fade"),{fade_ms})}}'
             f'async function update(){{try{{const r=await fetch("/popout_data/{self.popout_id}");'
             f'const d=await r.json();const e=document.getElementById("r");'
-            f'const n=d.recognized||"Waiting...";'
+            f'const n=d.recognized||"";'
             f"if(n!==e.textContent){{e.textContent=n;reset()}}"
             f'document.getElementById("t").textContent=d.translated||""'
             f"}}catch(e){{}}}}"
@@ -2131,7 +2131,7 @@ class VoiceTranslatorApp:
             f'document.addEventListener("DOMContentLoaded",()=>{{update();reset()}});</script>'
             f"</head><body>"
             f'<div id="c" class="container">'
-            f'<div id="r" class="rec">Waiting...</div>'
+            f'<div id="r" class="rec"></div>'
             f'<div id="t" class="tra"></div>'
             f"</div></body></html>"
         )
