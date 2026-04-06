@@ -112,7 +112,6 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 - requests>=2.31.0
 - translators>=5.9.1
 - argostranslate
-- langdetect
 
 ## 🚀 Installation
 

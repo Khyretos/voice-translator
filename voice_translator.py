@@ -374,7 +374,7 @@ window.__startAudioCapture = function(withWs) {
                 }
 
                 // Calculate PEAK RMS over 10 ms frames — exactly what the server VAD sees.
-                // (server uses blocksize=1600 → 10 frames of 160 samples each at 16 kHz)
+                // (server uses blocksize=480 → 3 frames of 160 samples each at 16 kHz)
                 var frameSize = 160;  // 10 ms at 16 kHz
                 var peakRms = 0;
                 for (var f = 0; f + frameSize <= outputData.length; f += frameSize) {
@@ -1506,7 +1506,7 @@ class VoiceTranslatorApp:
         try:
             self._monitor_stream = sd.RawInputStream(
                 samplerate=16000,
-                blocksize=1600,
+                blocksize=480,  # 30 ms — fast meter updates
                 device=mic,
                 dtype="int16",
                 channels=1,
@@ -1534,11 +1534,9 @@ class VoiceTranslatorApp:
     def audio_callback(self, indata, frames, time_info, status):
         if self.is_running:
             data = bytes(indata)
-            # Convert to float32 once
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Compute peak RMS over 10 ms frames inside this 100 ms chunk
-            frame_len = 160  # 10 ms at 16 kHz
+            frame_len = 160
             n_frames = len(samples) // frame_len
             if n_frames > 0:
                 peak_rms = 0.0
@@ -1549,7 +1547,6 @@ class VoiceTranslatorApp:
                         peak_rms = rms
                 self.monitor_level = peak_rms
             else:
-                # fallback to whole‑chunk RMS
                 self.monitor_level = float(np.sqrt(np.mean(samples**2)))
 
             self.audio_queue.put(data)
@@ -1752,7 +1749,7 @@ class VoiceTranslatorApp:
                 )
                 self.stream = sd.RawInputStream(
                     samplerate=16000,
-                    blocksize=1600,  # 100 ms – small enough for snappy VAD response
+                    blocksize=480,  # 30 ms — Vosk gets results ~3× faster; VAD fires sooner
                     device=microphone_index,
                     dtype="int16",
                     channels=1,
@@ -3342,7 +3339,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         )
 
         # Polling timers
-        gr.Timer(0.2).tick(
+        # 50 ms display poll — tight enough to show Vosk results within one blocksize of emission
+        gr.Timer(0.05).tick(
             update_display, outputs=[display_html, recognized_output, translated_output]
         )
         gr.Timer(1.0).tick(update_logs, outputs=[log_output])
@@ -3562,6 +3560,12 @@ if __name__ == "__main__":
         return FileResponse(path=font_path, media_type="font/ttf")
 
     interface = create_ui(args)
+    # Disable Gradio's built-in queue size limit and concurrency cap so it never
+    # drops a client connection (which manifests as a page reload).
+    interface.queue(
+        max_size=None,  # never refuse/drop connections
+        default_concurrency_limit=None,  # no cap on parallel event handlers
+    )
     fastapi_app = gr.mount_gradio_app(fastapi_app, interface, path="/", head=js)
 
     print(f"""
@@ -3577,4 +3581,12 @@ if __name__ == "__main__":
 ╚══════════════════════════════════════════════════════════════╝
     """)
 
-    uvicorn.run(fastapi_app, host=args.host, port=args.port, log_config=LOG_CONFIG)
+    uvicorn.run(
+        fastapi_app,
+        host=args.host,
+        port=args.port,
+        log_config=LOG_CONFIG,
+        timeout_keep_alive=0,  # 1 hour — never drop an idle SSE/WS connection
+        ws_ping_interval=300,  # keep WebSocket alive with pings every 30 s
+        ws_ping_timeout=600,  # give 2 minutes to respond before dropping
+    )
