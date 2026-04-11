@@ -240,6 +240,12 @@ function updateVolumeMeter(rmsLevel) {
     var aboveThreshold = db >= tDb;
     bar.style.background = aboveThreshold ? '#ff5555' : '#44cc44';
 
+    var led = document.getElementById('vad-led');
+    if (led) {
+        led.style.background = aboveThreshold ? '#44ff44' : '#888';
+        led.style.boxShadow = aboveThreshold ? '0 0 5px #44ff44' : 'none';
+    }
+
     // ── dB label ──────────────────────────────────────────────────────────────
     if (label) label.textContent = db.toFixed(1) + ' dB';
 
@@ -427,6 +433,60 @@ window.addEventListener('pagehide', function() {
     if (sessionDiv && sessionDiv.dataset.session)
         navigator.sendBeacon('/deactivate/' + sessionDiv.dataset.session, '');
 });
+
+// ── Display + Logs polling (bypasses Gradio SSE entirely) ────────────────
+// Both fetch directly from FastAPI endpoints. Zero Gradio SSE queue usage.
+// This prevents the page from ever reloading due to SSE queue pressure.
+window.__logsInterval    = null;
+
+window.startAllPolling = function() {
+    var sessionDiv = document.getElementById('session-data');
+    if (!sessionDiv || !sessionDiv.dataset.session) return false;
+    var session = sessionDiv.dataset.session;
+
+    // Logs polling only (display is now handled by Gradio timer)
+    if (!window.__logsInterval) {
+        window.__logsInterval = setInterval(function() {
+            fetch('/logs_data/' + session)
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    var el = document.querySelector('textarea[elem_id="log_output"], #log_output textarea');
+                    if (!el) {
+                        var labels = document.querySelectorAll('label');
+                        for (var i = 0; i < labels.length; i++) {
+                            if (labels[i].textContent.trim() === 'Log') {
+                                var ta = labels[i].closest('.block') && labels[i].closest('.block').querySelector('textarea');
+                                if (ta) { el = ta; break; }
+                            }
+                        }
+                    }
+                    if (el && d.logs !== undefined) el.value = d.logs;
+                })
+                .catch(function() {});
+        }, 2000);
+    }
+    return true;
+};
+
+window.stopAllPolling = function() {
+    if (window.__displayInterval) { clearInterval(window.__displayInterval); window.__displayInterval = null; }
+    if (window.__logsInterval)    { clearInterval(window.__logsInterval);    window.__logsInterval    = null; }
+};
+
+// Start polling as soon as Gradio has injected the session-data div.
+// Use a brief retry loop — Gradio renders async, typically < 500ms.
+document.addEventListener('DOMContentLoaded', function() {
+    var attempts = 0;
+    var boot = setInterval(function() {
+        attempts++;
+        if (window.startAllPolling()) {
+            clearInterval(boot);
+        } else if (attempts > 50) {
+            // Give up after 5 s — Gradio took too long to inject session div
+            clearInterval(boot);
+        }
+    }, 100);
+});
 </script>
 """
 
@@ -436,6 +496,79 @@ def dots_or_stars(input_str: str, second_arg=None) -> bool:
     if input_str == "." or re.match(r"<\|.*|>", input_str):
         return True
     return False
+
+
+# Known Whisper hallucinations produced when fed noise/silence/desk taps.
+# Whisper was trained on subtitles which have polite phrases at segment ends.
+# Any short segment that matches these exactly (case-insensitive, stripped) is dropped.
+_WHISPER_HALLUCINATIONS: set[str] = {
+    "thank you",
+    "thank you.",
+    "thanks for watching",
+    "thanks for watching.",
+    "thanks for watching!",
+    "thank you for watching",
+    "thank you for watching.",
+    "you",
+    "you.",
+    "bye",
+    "bye.",
+    "bye!",
+    "goodbye",
+    "goodbye.",
+    "like and subscribe",
+    "like and subscribe.",
+    "subscribe",
+    "music",
+    "music.",
+    "[music]",
+    "(music)",
+    "[applause]",
+    "(applause)",
+    "applause",
+    "applause.",
+    "[laughter]",
+    "(laughter)",
+    "laughter",
+    "hmm",
+    "hmm.",
+    "hm",
+    "hm.",
+    "uh",
+    "uh.",
+    "um",
+    "um.",
+    "ah",
+    "ah.",
+    "oh",
+    "oh.",
+    "okay",
+    "okay.",
+    "ok",
+    "ok.",
+    ".",
+    "..",
+    "...",
+    "…",
+    "[silence]",
+    "(silence)",
+    "[noise]",
+    "(noise)",
+    "[inaudible]",
+    "(inaudible)",
+    "subtitles by",
+    "subtitles by the amara.org community",
+    "www.mooji.org",
+    "www.facebook.com",
+    "the end",
+    "the end.",
+    "end.",
+}
+
+
+def is_whisper_hallucination(text: str) -> bool:
+    """Return True if text is a known Whisper hallucination / filler output."""
+    return text.strip().lower() in _WHISPER_HALLUCINATIONS
 
 
 # ── Argos Translate ───────────────────────────────────────────────────────────
@@ -655,6 +788,11 @@ _F_SAMP = _F_RATE * _F_MS // 1000  # 160 samples
 _F_BYTES = _F_SAMP * 2  # 320 bytes (int16 mono)
 _PREROLL = 3  # frames before speech onset (~30 ms)
 _MIN_SPCH = 3  # frames to confirm speech (~30 ms)
+# Minimum speech segment to dispatch to Whisper/Moonshine.
+# Segments shorter than this are almost always desk taps / breath / noise.
+# 500 ms = 50 frames.  Vosk is not affected (it handles segmentation itself).
+_MIN_DISPATCH_MS = 150
+_MIN_DISPATCH_FRAMES = _MIN_DISPATCH_MS // _F_MS  # 15
 # End-of-speech silence (default 300 ms = 30 frames).
 # ┌─ Whisper/Moonshine users: raise this if phrases are cut off mid-sentence.
 # │  Each unit = 10 ms. Recommended range: 20 (200 ms) … 60 (600 ms).
@@ -916,7 +1054,9 @@ class FastVAD:
                     self._segment.append(fb)
                     self._sil_count += 1
                     if self._sil_count >= self._end_silence_frames:
-                        if len(self._segment) >= _MIN_SPCH + _PREROLL:
+                        # Only dispatch segments long enough to contain real speech.
+                        # Short bursts (desk tap, breath, click that slipped past) are dropped.
+                        if len(self._segment) >= _MIN_DISPATCH_FRAMES:
                             segments.append(b"".join(self._segment))
                         self._segment = []
                         self._in_speech = False
@@ -1148,7 +1288,11 @@ class SubtitleManager:
         In buffered mode, interims are shown as temporary overlays.
         """
         with self._lock:
-            self._cur_rec = (text or "").strip()
+            stripped = (text or "").strip()
+            if stripped:
+                self._cur_rec = stripped
+                self._last_add = time.time()
+            # else: ignore empty interim – keep previous text
 
     def _split_into_sentences(self, text: str, max_chars: int = 100) -> list[str]:
         """Split text into sentences. If punctuation is missing, split by length."""
@@ -1358,7 +1502,7 @@ class VoiceTranslatorApp:
         "whisper_translate_compression_ratio_threshold": 2.4,
         # VAD — threshold + end-of-speech delay are both hot-reloadable
         "vad_threshold": -30.0,  # dB — the slider value is now in dB directly
-        "vad_end_silence_ms": 150,  # ms of silence before dispatching (Whisper/Moonshine)
+        "vad_end_silence_ms": 80,  # ms of silence before dispatching (Whisper/Moonshine)
         # Moonshine (moonshine-voice package)
         "moonshine_language": "en",
         "moonshine_cache_dir": "moonshine_models",
@@ -1375,7 +1519,9 @@ class VoiceTranslatorApp:
         self.session_hash = session_hash
         self.popout_id = secrets.token_urlsafe(16)
 
-        self.audio_queue: queue.Queue = queue.Queue()
+        self.audio_queue: queue.Queue = (
+            queue.Queue()
+        )  # ~450ms max backlog at 30ms blocks
         self.result_queue: queue.Queue = queue.Queue()
         self.is_running = False
         self.is_monitoring = False  # mic-test mode (level only, no recognition)
@@ -1466,7 +1612,7 @@ class VoiceTranslatorApp:
         """Push latest threshold + end_silence + noise filter into the running VAD."""
         if self.vad:
             self.vad.update_threshold(self.settings.get("vad_threshold", -30.0))
-            self.vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 150))
+            self.vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 80))
             thresh = self.settings.get("noise_filter_threshold", 0.0)
             self.vad.update_noise_filter_threshold(thresh)
 
@@ -1549,13 +1695,13 @@ class VoiceTranslatorApp:
             else:
                 self.monitor_level = float(np.sqrt(np.mean(samples**2)))
 
-            self.audio_queue.put(data)
+            self.audio_queue.put(data)  # <-- unbounded queue, never blocks
 
     def _get_or_create_vad(self) -> FastVAD:
         if self.vad is None:
             self.vad = FastVAD(
                 threshold_db=self.settings.get("vad_threshold", -30.0),
-                end_silence_ms=self.settings.get("vad_end_silence_ms", 150),
+                end_silence_ms=self.settings.get("vad_end_silence_ms", 80),
                 noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
             )
         return self.vad
@@ -1633,7 +1779,11 @@ class VoiceTranslatorApp:
                     speech_bytes, language=self.settings.get("whisper_language")
                 )
             if transcription and not dots_or_stars(transcription):
-                if self.is_valid_transcription(transcription):
+                if is_whisper_hallucination(transcription):
+                    self.logger.log(
+                        f"Blocked hallucination: {repr(transcription)}", level="debug"
+                    )
+                elif self.is_valid_transcription(transcription):
                     self.result_queue.put(("final", transcription))
                 else:
                     self.logger.log("Discarded invalid transcription", level="debug")
@@ -1645,7 +1795,8 @@ class VoiceTranslatorApp:
     def process_audio_hardware(self):
         while self.is_running:
             try:
-                data = self.audio_queue.get(timeout=0.1)
+                # Timeout matches blocksize (30ms) so we never wait longer than one block
+                data = self.audio_queue.get(timeout=0.03)
                 engine = self.settings["recognition_engine"]
                 if engine == "vosk":
                     self._process_vosk(data)
@@ -1702,6 +1853,10 @@ class VoiceTranslatorApp:
                 self.moonshine_recognizer = None
 
             elif engine == "moonshine":
+                if not _MOONSHINE_AVAILABLE:
+                    msg = "❌ Moonshine is not installed. Run: pip install moonshine-voice"
+                    self.logger.log(msg, level="error")
+                    return msg
                 self.moonshine_recognizer = MoonshineRecognizer(
                     language=self.settings["moonshine_language"],
                     cache_dir=self.settings["moonshine_cache_dir"],
@@ -1709,9 +1864,6 @@ class VoiceTranslatorApp:
                     logger=self.logger,
                 )
                 self.moonshine_recognizer.start()
-                self.recognizer = None
-                self.model = None
-                self.whisper_recognizer = None
 
             # Stop mic monitor if it was running — recognition provides the level now
             if self.is_monitoring:
@@ -1722,7 +1874,7 @@ class VoiceTranslatorApp:
                 self.vad.flush()
             self.vad = FastVAD(
                 threshold_db=self.settings.get("vad_threshold", -30.0),
-                end_silence_ms=self.settings.get("vad_end_silence_ms", 150),
+                end_silence_ms=self.settings.get("vad_end_silence_ms", 80),
                 noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
             )
 
@@ -1846,7 +1998,7 @@ class VoiceTranslatorApp:
     def _update_display_loop(self):
         while self.display_running:
             try:
-                result_type, text = self.result_queue.get(timeout=0.1)
+                result_type, text = self.result_queue.get(timeout=0.02)  # 20ms max wait
                 if result_type == "stop":
                     break
                 if result_type == "final":
@@ -1855,20 +2007,16 @@ class VoiceTranslatorApp:
                         translated = self._translate(text)
                     self.subtitles.add(text, translated)
                 elif result_type == "interim" and self.settings.get("display_interim"):
-                    # Only show interims in instant mode, or as preview in buffered mode
-                    if self.settings.get("subtitle_mode") == "instant":
-                        self.subtitles.set_interim(text)
-                    else:
-                        # In buffered mode, interims are shown temporarily
-                        self.subtitles.set_interim(text)
+                    self.subtitles.set_interim(text)
             except queue.Empty:
                 if not self.display_running:
                     break
-                time.sleep(0.05)
+                time.sleep(0.005)
+                # No sleep — tight loop so results appear as fast as possible.
+                # CPU cost is negligible (most iterations are the 20ms queue timeout).
             except Exception as exc:
                 if self.display_running:
                     self.logger.log(f"Display loop error: {exc}", level="error")
-                time.sleep(0.1)
 
     def _translate(self, text: str) -> str:
         """Translate text using the configured translation mode."""
@@ -2228,7 +2376,7 @@ def close_session(session_hash: str):
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 def create_ui(args):  # noqa: C901  (complex but intentional)
-    with gr.Blocks(title="Voice Translator") as interface:
+    with gr.Blocks(title="Voice Translator", analytics_enabled=False) as interface:
         # ── Header ────────────────────────────────────────────────────────────
         with gr.Row():
             with gr.Column(scale=1):
@@ -2251,11 +2399,19 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             with gr.Column(scale=1):
                 # Speech recognition
                 with gr.Accordion("🗣️ Speech Recognition", open=True):
+                    engine_choices = ["vosk", "whisper"]
+                    if _MOONSHINE_AVAILABLE:
+                        engine_choices.append("moonshine")
                     recognition_engine = gr.Radio(
-                        ["vosk", "whisper", "moonshine"],
+                        engine_choices,
                         value="vosk",
                         label="Recognition Engine",
-                        info="Vosk: offline/fast | Whisper: online/accurate | Moonshine: local/lightweight",
+                        info="Vosk: offline/fast | Whisper: online/accurate | Moonshine: local/lightweight"
+                        + (
+                            ""
+                            if _MOONSHINE_AVAILABLE
+                            else " (Moonshine not installed, run `pip install moonshine-voice`)"
+                        ),
                     )
 
                     with gr.Group(visible=True) as vosk_settings:
@@ -2434,7 +2590,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         vad_end_silence_ms = gr.Slider(
                             minimum=0,
                             maximum=2000,
-                            value=150,
+                            value=80,
                             step=50,
                             label="End-of-speech pause (ms)",
                             info="How long silence must last before a segment is sent. "
@@ -2460,6 +2616,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         # White vertical line  = peak hold (2 s decay).
                         # Bar turns RED when above threshold (VAD is active).
                         gr.HTML("""
+<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+  <div id="vad-led" style="width: 14px; height: 14px; border-radius: 50%; background: #888; box-shadow: 0 0 2px #000; transition: background 0.05s;"></div>
+  <span style="font-size: 12px; color: #ccc;">VAD active</span>
+</div>
 <div style="margin:4px 0 2px; font-size:11px; color:#aaa; display:flex; justify-content:space-between; user-select:none;">
   <span>-60</span><span>-45</span><span>-30</span><span>-15</span><span>0 dB</span>
 </div>
@@ -2636,11 +2796,17 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                     )
                     random_btn = gr.Button("🎲 Random", scale=1, size="sm")
 
-                display_html = gr.HTML(value="<div>Loading...</div>")
+                display_html = gr.HTML(label="Display", value="<div>Loading...</div>")
 
                 with gr.Accordion("Outputs", open=False):
-                    recognized_output = gr.Textbox(label="Recognized")
-                    translated_output = gr.Textbox(label="Translated")
+                    recognized_output = gr.Textbox(
+                        label="Recognized",
+                        elem_id="recognized-output-text",
+                    )
+                    translated_output = gr.Textbox(
+                        label="Translated",
+                        elem_id="translated-output-text",
+                    )
 
                 with gr.Accordion("🎨 Display Style", open=False):
                     custom_fonts = get_available_fonts()
@@ -2735,6 +2901,11 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             label="Sentences per chunk",
                             info="How many sentences to show at once before advancing.",
                         )
+
+                with gr.Row():
+                    reset_defaults_btn = gr.Button(
+                        "🔄 Reset to Defaults", variant="secondary", size="sm"
+                    )
 
         log_output = gr.Textbox(label="Log", lines=6)
 
@@ -2993,7 +3164,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             font_value = s.get("custom_font") or s["font_family"]
             session_html = (
                 f'<div id="session-data" data-session="{request.session_hash}" '
-                f'data-ws-path="/ws/{request.session_hash}">'
+                f'data-ws-path="/ws/{request.session_hash}" '
+                f'data-popout="{app.popout_id}">'
                 f"<b>Each tab = separate session • Refresh = new session</b></div>"
             )
 
@@ -3087,6 +3259,104 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 browser_status: "Ready",
                 custom_popout_id: app.popout_id,
                 session_dropdown: gr.update(choices=[]),
+                noise_filter_threshold: s["noise_filter_threshold"],
+            }
+
+        def reset_to_defaults(request: gr.Request):
+            app = get_or_create_app(request.session_hash)
+            # Overwrite with defaults, but keep session_hash, popout_id, etc. – those are not in DEFAULT_SETTINGS
+            app.settings.update(VoiceTranslatorApp.DEFAULT_SETTINGS)
+            # Also update subtitle manager and VAD with the new values
+            app.apply_subtitle_settings()
+            app.apply_vad_settings()
+            persist_settings(app.settings)
+
+            # Build the same output dictionary as handle_ui_load
+            s = app.settings
+            return {
+                vosk_model_dropdown: s["vosk_model"],
+                mic_dropdown: s.get("microphone"),
+                recognition_engine: s["recognition_engine"],
+                audio_mode: s["audio_mode"],
+                enable_translation: s["enable_translation"],
+                display_interim: s["display_interim"],
+                translation_mode: s["translation_mode"],
+                source_lang: s["source_language"],
+                target_lang: s["target_language"],
+                font_selector: s.get("custom_font") or s["font_family"],
+                recognized_font_size: s["recognized_font_size"],
+                translated_font_size: s["translated_font_size"],
+                recognized_color: s["recognized_color"],
+                translated_color: s["translated_color"],
+                background_color: s["background_color"],
+                text_alignment: s["text_alignment"],
+                translation_position: s["translation_position"],
+                whisper_host: s["whisper_host"],
+                whisper_api_key: s["whisper_api_key"],
+                whisper_model: s["whisper_model"],
+                whisper_language: s["whisper_language"],
+                whisper_temperature: s["whisper_temperature"],
+                whisper_best_of: s["whisper_best_of"],
+                whisper_beam_size: s["whisper_beam_size"],
+                whisper_patience: s["whisper_patience"],
+                whisper_length_penalty: s["whisper_length_penalty"],
+                whisper_suppress_tokens: s["whisper_suppress_tokens"],
+                whisper_initial_prompt: s["whisper_initial_prompt"],
+                whisper_condition_on_previous_text: s[
+                    "whisper_condition_on_previous_text"
+                ],
+                whisper_temperature_increment_on_fallback: s[
+                    "whisper_temperature_increment_on_fallback"
+                ],
+                whisper_no_speech_threshold: s["whisper_no_speech_threshold"],
+                whisper_logprob_threshold: s["whisper_logprob_threshold"],
+                whisper_compression_ratio_threshold: s[
+                    "whisper_compression_ratio_threshold"
+                ],
+                whisper_trans_host: s["whisper_translate_host"],
+                whisper_trans_api_key: s["whisper_translate_api_key"],
+                whisper_trans_model: s["whisper_translate_model"],
+                whisper_trans_temperature: s["whisper_translate_temperature"],
+                whisper_trans_best_of: s["whisper_translate_best_of"],
+                whisper_trans_beam_size: s["whisper_translate_beam_size"],
+                whisper_trans_patience: s["whisper_translate_patience"],
+                whisper_trans_length_penalty: s["whisper_translate_length_penalty"],
+                whisper_trans_suppress_tokens: s["whisper_translate_suppress_tokens"],
+                whisper_trans_initial_prompt: s["whisper_translate_initial_prompt"],
+                whisper_trans_condition_on_previous_text: s[
+                    "whisper_translate_condition_on_previous_text"
+                ],
+                whisper_trans_temperature_increment_on_fallback: s[
+                    "whisper_translate_temperature_increment_on_fallback"
+                ],
+                whisper_trans_no_speech_threshold: s[
+                    "whisper_translate_no_speech_threshold"
+                ],
+                whisper_trans_logprob_threshold: s[
+                    "whisper_translate_logprob_threshold"
+                ],
+                whisper_trans_compression_ratio_threshold: s[
+                    "whisper_translate_compression_ratio_threshold"
+                ],
+                argos_source: s["argos_source_lang"],
+                argos_target: s["argos_target_lang"],
+                fade_timeout: s["fade_timeout"],
+                libretranslate_host: s["libretranslate_host"],
+                libretranslate_api_key: s["libretranslate_api_key"],
+                ai_host: s["ai_host"],
+                ai_api_key: s["ai_api_key"],
+                ai_model: s["ai_model"],
+                outline_width: s["outline_width"],
+                outline_color: s["outline_color"],
+                translated_outline_width: s["translated_outline_width"],
+                translated_outline_color: s["translated_outline_color"],
+                vad_threshold: s["vad_threshold"],
+                vad_end_silence_ms: s["vad_end_silence_ms"],
+                subtitle_mode: s["subtitle_mode"],
+                subtitle_cps: s["subtitle_cps"],
+                subtitle_max_lines: s["subtitle_max_lines"],
+                moonshine_language: s["moonshine_language"],
+                moonshine_cache_dir: s["moonshine_cache_dir"],
                 noise_filter_threshold: s["noise_filter_threshold"],
             }
 
@@ -3338,14 +3608,86 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             fn=None, js="stopHwLevelPolling"
         )
 
-        # Polling timers
-        # 50 ms display poll — tight enough to show Vosk results within one blocksize of emission
+        reset_defaults_btn.click(
+            reset_to_defaults,
+            outputs=[
+                vosk_model_dropdown,
+                mic_dropdown,
+                recognition_engine,
+                audio_mode,
+                enable_translation,
+                display_interim,
+                translation_mode,
+                source_lang,
+                target_lang,
+                font_selector,
+                recognized_font_size,
+                translated_font_size,
+                recognized_color,
+                translated_color,
+                background_color,
+                text_alignment,
+                translation_position,
+                whisper_host,
+                whisper_api_key,
+                whisper_model,
+                whisper_language,
+                whisper_temperature,
+                whisper_best_of,
+                whisper_beam_size,
+                whisper_patience,
+                whisper_length_penalty,
+                whisper_suppress_tokens,
+                whisper_initial_prompt,
+                whisper_condition_on_previous_text,
+                whisper_temperature_increment_on_fallback,
+                whisper_no_speech_threshold,
+                whisper_logprob_threshold,
+                whisper_compression_ratio_threshold,
+                whisper_trans_host,
+                whisper_trans_api_key,
+                whisper_trans_model,
+                whisper_trans_temperature,
+                whisper_trans_best_of,
+                whisper_trans_beam_size,
+                whisper_trans_patience,
+                whisper_trans_length_penalty,
+                whisper_trans_suppress_tokens,
+                whisper_trans_initial_prompt,
+                whisper_trans_condition_on_previous_text,
+                whisper_trans_temperature_increment_on_fallback,
+                whisper_trans_no_speech_threshold,
+                whisper_trans_logprob_threshold,
+                whisper_trans_compression_ratio_threshold,
+                argos_source,
+                argos_target,
+                fade_timeout,
+                libretranslate_host,
+                libretranslate_api_key,
+                ai_host,
+                ai_api_key,
+                ai_model,
+                outline_width,
+                outline_color,
+                translated_outline_width,
+                translated_outline_color,
+                vad_threshold,
+                vad_end_silence_ms,
+                subtitle_mode,
+                subtitle_cps,
+                subtitle_max_lines,
+                moonshine_language,
+                moonshine_cache_dir,
+                noise_filter_threshold,
+            ],
+        )
+
+        # ── Polling timers (reliable Gradio method) ───────────────────────────
         gr.Timer(0.05).tick(
             update_display, outputs=[display_html, recognized_output, translated_output]
         )
         gr.Timer(1.0).tick(update_logs, outputs=[log_output])
 
-        # Lifecycle
         interface.unload(cleanup_user_data)
         interface.load(
             handle_ui_load,
@@ -3494,6 +3836,28 @@ if __name__ == "__main__":
             return JSONResponse({"rms": app.monitor_level})
         return JSONResponse({"rms": 0.0})
 
+    @fastapi_app.get("/display_data/{session_hash}")
+    async def get_display_data(session_hash: str):
+        """
+        Polled directly by JS every 50 ms — completely bypasses Gradio's SSE queue.
+        This is what makes the display update without ever triggering a page reload.
+        """
+        with SESSION_LOCK:
+            app = SESSION_APPS.get(session_hash)
+        if app:
+            html, rec, trans = app.get_current_display()
+            return JSONResponse({"html": html, "recognized": rec, "translated": trans})
+        return JSONResponse({"html": "", "recognized": "", "translated": ""})
+
+    @fastapi_app.get("/logs_data/{session_hash}")
+    async def get_logs_data(session_hash: str):
+        """Polled by JS every 2 s — serves log text without using Gradio SSE."""
+        with SESSION_LOCK:
+            app = SESSION_APPS.get(session_hash)
+        if app:
+            return JSONResponse({"logs": app.update_logs()})
+        return JSONResponse({"logs": ""})
+
     @fastapi_app.get("/active_sessions")
     async def get_active_sessions():
         with SESSION_LOCK:
@@ -3587,6 +3951,6 @@ if __name__ == "__main__":
         port=args.port,
         log_config=LOG_CONFIG,
         timeout_keep_alive=0,  # 1 hour — never drop an idle SSE/WS connection
-        ws_ping_interval=300,  # keep WebSocket alive with pings every 30 s
-        ws_ping_timeout=600,  # give 2 minutes to respond before dropping
+        ws_ping_interval=30,  # keep WebSocket alive with pings every 30 s
+        ws_ping_timeout=120,  # give 2 minutes to respond before dropping
     )

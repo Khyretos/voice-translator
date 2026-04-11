@@ -87,33 +87,32 @@ class TranslationService:
             self.logger.log(f"AI API response parsing error: {str(e)}", level="error")
             raise
 
-    def _translate_libretranslate(self, text: str, source_lang: str, target_lang: str) -> str:
+    def _translate_libretranslate(
+        self, text: str, source_lang: str, target_lang: str
+    ) -> str:
         """Translate using LibreTranslate service"""
         try:
             # Normalize language codes: "en-US" -> "en", "es-ES" -> "es", etc.
-            src = source_lang.split('-')[0] if source_lang else "auto"
-            tgt = target_lang.split('-')[0] if target_lang else "en"
+            src = source_lang.split("-")[0] if source_lang else "auto"
+            tgt = target_lang.split("-")[0] if target_lang else "en"
 
             host = self.settings.get("libretranslate_host", "http://localhost:5000")
             api_key = self.settings.get("libretranslate_api_key", "")
 
             # Build URL: ensure it ends with /translate
-            base = host.rstrip('/')
-            if not base.endswith('/translate'):
+            base = host.rstrip("/")
+            if not base.endswith("/translate"):
                 url = f"{base}/translate"
             else:
                 url = base
 
-            payload = {
-                "q": text,
-                "source": src,
-                "target": tgt,
-                "format": "text"
-            }
+            payload = {"q": text, "source": src, "target": tgt, "format": "text"}
             if api_key:
                 payload["api_key"] = api_key
 
-            self.logger.log(f"LibreTranslate request to {url} ({src}->{tgt})", level="info")
+            self.logger.log(
+                f"LibreTranslate request to {url} ({src}->{tgt})", level="info"
+            )
 
             response = requests.post(url, json=payload, timeout=10)
             response.raise_for_status()
@@ -122,17 +121,22 @@ class TranslationService:
             translated_text = result.get("translatedText", "")
 
             if not translated_text:
-                self.logger.log("LibreTranslate returned empty translation", level="warning")
+                self.logger.log(
+                    "LibreTranslate returned empty translation", level="warning"
+                )
                 return ""
 
             self.logger.log(
                 f"LibreTranslate: '{text}' -> '{translated_text}' ({src}->{tgt})",
-                level="info"
+                level="info",
             )
             return translated_text
 
         except requests.exceptions.ConnectionError:
-            self.logger.log("LibreTranslate connection error - is the server running?", level="error")
+            self.logger.log(
+                "LibreTranslate connection error - is the server running?",
+                level="error",
+            )
             return f"[LibreTranslate not reachable at {host}]"
         except requests.exceptions.Timeout:
             self.logger.log("LibreTranslate request timed out", level="error")
