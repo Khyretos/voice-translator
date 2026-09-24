@@ -38,6 +38,7 @@ from recognizers import (
 )
 from vad import FastVAD, _WRTCVAD_AVAILABLE
 from live_whisper import LiveWhisperWorker
+from audio_input import open_input_stream
 from subtitles import SubtitleManager
 from session import (
     SessionSlugMiddleware,
@@ -1073,13 +1074,10 @@ class VoiceTranslatorApp:
             if mic is None:
                 return "❌ No microphone selected"
             try:
-                self._monitor_stream = sd.RawInputStream(
-                    samplerate=16000,
-                    blocksize=480,  # 30 ms — fast meter updates
-                    device=mic,
-                    dtype="int16",
-                    channels=1,
-                    callback=self._monitor_callback,
+                # 16 kHz if the device supports it, else its own rate
+                # resampled to 16 kHz (see audio_input.py). 30 ms blocks.
+                self._monitor_stream = open_input_stream(
+                    mic, self._monitor_callback, logger=self.logger
                 )
                 self._monitor_stream.start()
                 self.is_monitoring = True
@@ -1480,13 +1478,10 @@ class VoiceTranslatorApp:
                 self.logger.log(
                     f"Using hardware mic: {device_info['name']}", level="info"
                 )
-                self.stream = sd.RawInputStream(
-                    samplerate=16000,
-                    blocksize=480,  # 30 ms — Vosk gets results ~3× faster; VAD fires sooner
-                    device=microphone_index,
-                    dtype="int16",
-                    channels=1,
-                    callback=self.audio_callback,
+                # 16 kHz if the device supports it, else its own rate
+                # resampled to 16 kHz (see audio_input.py). 30 ms blocks.
+                self.stream = open_input_stream(
+                    microphone_index, self.audio_callback, logger=self.logger
                 )
                 self.stream.start()
                 msg = "✅ Recognition started (Hardware)"
