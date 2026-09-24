@@ -69,7 +69,7 @@ supported for this source.
 
 ## How it works
 
-`discord_bridge/bridge.js` is a small Node.js program, started by the app
+`discord_bridge/bridge.js` (with `audio.js`) is a small Node.js program, started by the app
 for each running Discord session and stopped with it. Node is used because
 receiving voice means decrypting Discord's end-to-end voice encryption
 (DAVE). `@discordjs/voice` supports that, while the Python Discord libraries

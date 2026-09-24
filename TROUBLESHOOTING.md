@@ -165,6 +165,15 @@ reports most problems directly.
   Node.js 22.12+ and run `npm ci` in `discord_bridge/`.
 - **"Could not connect to #channel"**: the bot lacks the *Connect*
   permission in that channel.
+- **Captions silently stop; the log shows `decode error … Invalid packet`**:
+  fixed. Discord's end-to-end voice encryption briefly delivers audio that
+  can't be decoded while its keys change (someone joins/leaves, the bot is
+  moved). That used to shut down the speaker's decoder for good; bad packets
+  are now skipped. If audio stays undecodable for several seconds, the bot
+  rejoins the channel by itself and logs `could not be decrypted —
+  reconnecting` as a warning.
+- **The bot was dragged to another channel**: it goes back to the channel
+  of the user it follows (logged as a warning).
 - **Someone isn't captioned**: check they're not in **Ignore these user IDs**,
   and that **Max speakers on screen** isn't lower than the number of people
   talking at once.

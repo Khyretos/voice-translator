@@ -138,6 +138,8 @@ class DiscordPipeline:
                     self._joined.set()
                 else:
                     self._stop_session(f"🔌 Discord: {reason} — session stopped")
+        elif kind == "log":
+            log(ev.get("message", ""), level=ev.get("level", "info"))
         elif kind == "speaker":
             self.app.speaker_board.set_info(
                 str(ev.get("user_id")), ev.get("name", ""), ev.get("avatar", "")
