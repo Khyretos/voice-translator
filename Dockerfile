@@ -20,10 +20,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN apt-get remove -y build-essential python3-dev && apt-get autoremove -y
 
 # Copy application files (multiple sources -> destination must end with /)
-# NOTE: voice_translator.py was split into several modules (Phase 7 refactor
-# — see REFACTOR.md) — all of them need to be copied, not just the entry
-# point, or the container will fail on import at startup.
-COPY voice_translator.py translators.py logger.py session.py settings_store.py vad.py subtitles.py recognizers.py ./
+# The app is split across several modules (see REFACTOR.md) and all of them
+# are needed at startup — copy every top-level .py instead of listing them,
+# so a newly added module (e.g. live_whisper.py) can't be forgotten here.
+COPY *.py ./
 
 # Create required directories
 RUN mkdir -p /voice_translator/vosk_models /voice_translator/argos_models /voice_translator/logs /voice_translator/fonts /app/settings
