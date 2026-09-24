@@ -86,14 +86,9 @@ Open your browser to `http://localhost:7860`.
 3. Set width/height (e.g., 1920×200 for a caption bar, or 1920×1080 with
    **Vertical position: Bottom** for subtitles over the whole stream).
 
-4. (Optional) Add custom CSS to remove background:
-
-   ```css
-   body {
-     background-color: rgba(0, 0, 0, 0);
-     overflow: hidden;
-   }
-   ```
+4. (Optional) For a background only behind the text instead of the whole
+   source, set **Background → Behind text only** in the display settings
+   (adjust **Background opacity** for a see-through box).
 
 ### Next Steps
 

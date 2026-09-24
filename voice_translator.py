@@ -819,6 +819,11 @@ class VoiceTranslatorApp:
         "recognized_color": "#FFFFFF",
         "translated_color": "#CCCCCC",
         "background_color": "#000000",
+        # "full": background fills the whole popout (the browser source).
+        # "text": only a rounded box behind the text / each speaker row, which
+        # fades with it — like a chat overlay; the rest stays transparent.
+        "background_mode": "full",
+        "background_opacity": 100,  # % — below 100 gives a see-through box/area
         "text_alignment": "center",
         "vertical_alignment": "middle",  # top | middle | bottom (bottom = classic subtitles)
         "translation_position": "after",
@@ -2036,14 +2041,18 @@ class VoiceTranslatorApp:
         valign = self._VERTICAL_MAP.get(
             self.settings.get("vertical_alignment", "middle"), "center"
         )
+        box = self._box_css()
+        body = "".join(parts)
+        if box and body:
+            body = f'<div style="{box}max-width:100%">{body}</div>'
         return (
             f"<style>{font_face}</style>"
             f'<div style="display:flex;flex-direction:column;justify-content:{valign};'
-            f'padding:20px;background-color:{self.settings["background_color"]};min-height:200px;">'
+            f'padding:20px;background-color:{self._area_bg()};min-height:200px;">'
             f'<div class="vt-lines" style="transition:opacity 0.5s;opacity:1;display:flex;'
             f"flex-direction:column;align-items:{alignment_map[self.settings['text_alignment']]};"
             f"text-align:{self.settings['text_alignment']};\">"
-            + "".join(parts)
+            + body
             + "</div></div>"
         )
 
@@ -2098,13 +2107,14 @@ class VoiceTranslatorApp:
             )
             out.append(
                 f'<div style="display:flex;flex-direction:{direction};align-items:center;gap:12px;'
-                f'margin:6px 0;text-align:{halign};font-family:{family};white-space:pre-wrap">'
+                f'margin:6px 0;text-align:{halign};font-family:{family};white-space:pre-wrap;'
+                f'{self._box_css(radius=16, padding="8px 14px")}">'
                 f"{avatar}<div>{name}{lines}</div></div>"
             )
         return (
             f"<style>{self._get_font_face_css()}</style>"
             f'<div style="display:flex;flex-direction:column;justify-content:{valign};'
-            f'padding:20px;background-color:{s["background_color"]};min-height:200px;">'
+            f'padding:20px;background-color:{self._area_bg()};min-height:200px;">'
             f'<div class="vt-lines" style="transition:opacity 0.5s;opacity:1;display:flex;'
             f'flex-direction:column;align-items:{align_items};">' + "".join(out) + "</div></div>"
         )
@@ -2143,6 +2153,37 @@ class VoiceTranslatorApp:
             f"@font-face {{font-family:'{font_name}';"
             f"src:url('/fonts/{custom_font}') format('truetype');"
             f"font-weight:normal;font-style:normal;}}"
+        )
+
+    def _bg_color(self) -> str:
+        """background_color with background_opacity applied, as CSS."""
+        color = str(self.settings.get("background_color") or "#000000").strip()
+        try:
+            alpha = max(0, min(100, int(self.settings.get("background_opacity", 100)))) / 100
+        except (TypeError, ValueError):
+            alpha = 1.0
+        m = re.fullmatch(r"#?([0-9a-fA-F]{6})([0-9a-fA-F]{2})?", color)
+        if not m:
+            return color  # rgba()/named colours: use as given
+        r, g, b = (int(m.group(1)[i : i + 2], 16) for i in (0, 2, 4))
+        if m.group(2):
+            alpha *= int(m.group(2), 16) / 255
+        return f"rgba({r},{g},{b},{alpha:.3g})"
+
+    def _text_box_mode(self) -> bool:
+        return self.settings.get("background_mode") == "text"
+
+    def _area_bg(self) -> str:
+        """Background of the whole popout/preview area."""
+        return "transparent" if self._text_box_mode() else self._bg_color()
+
+    def _box_css(self, radius: int = 10, padding: str = "8px 16px") -> str:
+        """Background box behind text (only in 'behind text only' mode)."""
+        if not self._text_box_mode():
+            return ""
+        return (
+            f"background:{self._bg_color()};padding:{padding};"
+            f"border-radius:{radius}px;box-sizing:border-box;"
         )
 
     def _get_outline_css(self, width: int, color: str) -> str:
@@ -2239,12 +2280,13 @@ class VoiceTranslatorApp:
             f'<!DOCTYPE html><html><head><title>Display</title><meta charset="UTF-8">'
             f"<style>{self._get_font_face_css()}"
             f"body,html{{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden;"
-            f"background:{s['background_color']};}}"
+            f"background:{self._area_bg()};}}"
             f"body{{display:flex;flex-direction:column;justify-content:{valign};}}"
             f"#list{{box-sizing:border-box;width:100%;padding:20px;display:flex;"
             f"flex-direction:column;align-items:{align_items}}}"
             f".row{{display:flex;flex-direction:{direction};align-items:center;gap:14px;"
-            f"margin:8px 0;max-width:100%;transition:opacity 0.5s;opacity:1}}"
+            f"margin:8px 0;max-width:100%;transition:opacity 0.5s;opacity:1;"
+            f"{self._box_css(radius=16, padding='8px 14px')}}}"
             f".row.fade{{opacity:0}}"
             f".avatar{{width:{avatar_px}px;height:{avatar_px}px;border-radius:50%;flex:none;"
             f"object-fit:cover;background:#5865F2;color:#fff;display:flex;align-items:center;"
@@ -2322,9 +2364,11 @@ class VoiceTranslatorApp:
             f'<!DOCTYPE html><html><head><title>Display</title><meta charset="UTF-8">'
             f"<style>{font_face}"
             f"body,html{{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden;"
-            f"background:{self.settings['background_color']};}}"
+            f"background:{self._area_bg()};}}"
             f"body{{display:flex;flex-direction:column;justify-content:{valign};}}"
-            f".container{{box-sizing:border-box;padding:20px;width:100%;"
+            f".box{{display:inline-block;max-width:100%;vertical-align:top;{self._box_css()}}}"
+            + (".box>div{margin:4px 0}" if self._text_box_mode() else "")
+            + f".container{{box-sizing:border-box;padding:20px;width:100%;"
             f"text-align:{halign};transition:opacity 0.5s;opacity:1}}"
             f".container.fade{{opacity:0}}"
             f".rec,.tra{{margin:10px 0;font-family:{font_family};white-space:pre-wrap}}"
@@ -2356,13 +2400,13 @@ class VoiceTranslatorApp:
             f"update();setInterval(update,150)}});"
             f"</script>"
             f"</head><body>"
-            f'<div id="c" class="container fade">'
+            f'<div id="c" class="container fade"><div class="box">'
             + (
                 '<div id="t" class="tra"></div><div id="r" class="rec"></div>'
                 if self.settings.get("translation_position") == "before"
                 else '<div id="r" class="rec"></div><div id="t" class="tra"></div>'
             )
-            + "</div></body></html>"
+            + "</div></div></body></html>"
         )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -3335,6 +3379,18 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             label="Background", value="#000000"
                         )
                     with gr.Row():
+                        background_mode = gr.Radio(
+                            [("Whole area", "full"), ("Behind text only", "text")],
+                            value="full",
+                            label="Background",
+                            info="Behind text only: a rounded box behind each caption "
+                            "(and each Discord speaker) that fades with it; the rest of "
+                            "the browser source stays transparent.",
+                        )
+                        background_opacity = gr.Slider(
+                            0, 100, 100, step=5, label="Background opacity (%)"
+                        )
+                    with gr.Row():
                         text_alignment = gr.Radio(
                             ["left", "center", "right"], value="center", label="Align"
                         )
@@ -3786,6 +3842,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 recognized_color: s["recognized_color"],
                 translated_color: s["translated_color"],
                 background_color: s["background_color"],
+                background_mode: s["background_mode"],
+                background_opacity: s["background_opacity"],
                 text_alignment: s["text_alignment"],
                 vertical_alignment: s["vertical_alignment"],
                 translation_position: s["translation_position"],
@@ -3923,6 +3981,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 recognized_color: s["recognized_color"],
                 translated_color: s["translated_color"],
                 background_color: s["background_color"],
+                background_mode: s["background_mode"],
+                background_opacity: s["background_opacity"],
                 text_alignment: s["text_alignment"],
                 vertical_alignment: s["vertical_alignment"],
                 translation_position: s["translation_position"],
@@ -4201,6 +4261,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         recognized_color.change(_set("recognized_color"), [recognized_color])
         translated_color.change(_set("translated_color"), [translated_color])
         background_color.change(_set("background_color"), [background_color])
+        background_mode.change(_set("background_mode"), [background_mode])
+        background_opacity.change(_set("background_opacity"), [background_opacity])
         text_alignment.change(_set("text_alignment"), [text_alignment])
         vertical_alignment.change(_set("vertical_alignment"), [vertical_alignment])
         translation_position.change(
@@ -4391,6 +4453,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 recognized_color,
                 translated_color,
                 background_color,
+                background_mode,
+                background_opacity,
                 text_alignment,
                 vertical_alignment,
                 translation_position,
@@ -4533,6 +4597,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 recognized_color,
                 translated_color,
                 background_color,
+                background_mode,
+                background_opacity,
                 text_alignment,
                 vertical_alignment,
                 translation_position,

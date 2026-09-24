@@ -35,7 +35,8 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 - **Text Alignment** – left, center, or right
 - **Vertical Position** – top, middle, or bottom (bottom + a stream-sized popout = classic subtitles)
 - **Translation Position** – before or after the recognized text
-- **Background Color** – set any color (use `#00FF00` for chroma key)
+- **Background Color** – set any color (use `#00FF00` for chroma key), with adjustable opacity
+- **Background: whole area or behind text only** – "behind text only" draws a rounded box just behind each caption (and each Discord speaker row) that fades out with it, like a chat overlay; the rest of the browser source stays transparent
 - **Fade Timeout** – automatically fade text after a configurable pause
 - **Paced/Buffered Subtitle Mode** – each chunk is held on screen long enough to read both the recognized *and* translated text at your chosen reading speed, whichever is longer
 
@@ -400,7 +401,7 @@ Open the **Display Style** accordion to adjust:
 2. Copy the **Popout URL** from the UI (e.g., `http://localhost:7860/popout/abc123`).
 3. In OBS, add a **Browser Source** and paste the URL.
 4. Set desired width/height — e.g. 1920×200 for a caption bar, or 1920×1080 with **Vertical position: Bottom** for subtitles over the whole stream.
-5. Optionally add custom CSS to remove background.
+5. For a background only behind the text (the rest of the source transparent), set **Background → Behind text only** in the display settings; no custom CSS needed.
 
 Changing display settings in the app updates an open popout by itself — no need to refresh the browser source.
 

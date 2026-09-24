@@ -30,6 +30,8 @@ PERSISTABLE_KEYS = [
     "recognized_color",
     "translated_color",
     "background_color",
+    "background_mode",
+    "background_opacity",
     "text_alignment",
     "vertical_alignment",
     "translation_position",
