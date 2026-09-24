@@ -168,6 +168,28 @@ class SubtitleManager:
                 if not self._cur_rec and not self._cur_trans:
                     self._advance_locked()
 
+    def set_translation(self, recognized: str, translated: str):
+        """
+        Attach a translation to an already-displayed instant-mode line.
+
+        Instant mode now shows recognized text the moment it arrives and
+        fills in the translation when the (slower) translator returns,
+        instead of holding the recognized text back until translation is
+        done. Ignored if the line has since been replaced by a newer final.
+        """
+        recognized = (recognized or "").strip()
+        translated = (translated or "").strip()
+        if not recognized or not translated:
+            return
+        with self._lock:
+            if self.mode != "instant" or self._last_final_rec != recognized:
+                return
+            self._last_final_trans = translated
+            if self._cur_rec == recognized:
+                self._cur_trans = translated
+            # Restart the fade window so the translation gets full reading time.
+            self._last_add = time.time()
+
     def _advance_locked(self):
         """
         Pop the next chunk(s) into _cur_rec/_cur_trans and set the hold

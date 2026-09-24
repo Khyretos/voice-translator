@@ -140,3 +140,25 @@ class TestModeSwitching:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestSetTranslation:
+    def test_fills_in_translation_for_current_line(self):
+        sm = SubtitleManager(mode="instant", fade_timeout=5.0)
+        sm.add("hello there", "")
+        assert sm.get_display() == ("hello there", "")
+        sm.set_translation("hello there", "hola")
+        assert sm.get_display() == ("hello there", "hola")
+
+    def test_ignored_once_a_newer_line_replaced_it(self):
+        sm = SubtitleManager(mode="instant", fade_timeout=5.0)
+        sm.add("first", "")
+        sm.add("second", "")
+        sm.set_translation("first", "primero")
+        assert sm.get_display() == ("second", "")
+
+    def test_ignored_in_buffered_mode(self):
+        sm = SubtitleManager(mode="buffered", fade_timeout=5.0)
+        sm.add("first", "")
+        sm.set_translation("first", "primero")
+        assert sm.get_display()[1] == ""

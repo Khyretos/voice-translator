@@ -46,6 +46,11 @@ _MIN_DISPATCH_FRAMES = _MIN_DISPATCH_MS // _F_MS  # 15
 # │  Each unit = 10 ms. Recommended range: 20 (200 ms) … 60 (600 ms).
 # └─ Set via settings["vad_end_silence_ms"] in the UI.
 _DEFAULT_END_SLNC_FRAMES = 30
+# When a segment reaches max_segment_ms it's cut at the quietest frame in
+# its last _CUT_SEARCH_FRAMES frames (the likeliest gap between words), so
+# continuous speech is dispatched in pieces instead of only once the speaker
+# finally pauses — the difference between live captions and a 20 s lag.
+_CUT_SEARCH_FRAMES = 100  # search the last 1 s for a cut point
 
 
 class FastVAD:
@@ -72,9 +77,14 @@ class FastVAD:
     _N_BINS = _N_FFT // 2 + 1  # 129 rfft bins
 
     def __init__(
-        self, threshold_db=-30.0, end_silence_ms=300, noise_filter_threshold=0.0
+        self,
+        threshold_db=-30.0,
+        end_silence_ms=300,
+        noise_filter_threshold=0.0,
+        max_segment_ms=0,
     ):
         self._end_silence_frames = max(2, end_silence_ms // _F_MS)
+        self._set_max_segment(max_segment_ms)
         self._set_threshold(threshold_db)
         self._set_noise_filter(noise_filter_threshold)
         self._reset()
@@ -104,6 +114,14 @@ class FastVAD:
     def update_end_silence_ms(self, ms):
         self._end_silence_frames = max(2, int(ms) // _F_MS)
 
+    def _set_max_segment(self, ms):
+        """0 (or anything shorter than the cut-search window) = unlimited."""
+        frames = int(ms or 0) // _F_MS
+        self._max_segment_frames = frames if frames > _CUT_SEARCH_FRAMES else 0
+
+    def update_max_segment_ms(self, ms):
+        self._set_max_segment(ms)
+
     def _set_noise_filter(self, level):
         self._filter_level = max(0.0, min(1.0, float(level)))
         # Over-subtraction factor 1→4; spectral floor 0.05→0.001
@@ -129,12 +147,36 @@ class FastVAD:
     def _reset(self):
         self._preroll: list[bytes] = []
         self._segment: list[bytes] = []
+        self._seg_rms: list[float] = []  # per-frame RMS, parallel to _segment
         self._in_speech = False
         self._sil_count = 0
         self._leftover = b""
 
     def reset(self):
         self._reset()
+
+    @property
+    def in_speech(self) -> bool:
+        """True while an utterance is open (speech seen, end-of-speech not yet)."""
+        return self._in_speech
+
+    def current_segment(self) -> bytes:
+        """Audio of the utterance in progress so far (b"" when none) — for interim results."""
+        return b"".join(self._segment) if self._in_speech else b""
+
+    def current_segment_ms(self) -> int:
+        return len(self._segment) * _F_MS if self._in_speech else 0
+
+    def _cut_long_segment(self) -> bytes:
+        """Split an over-long open segment at its quietest recent frame; return the head."""
+        n = len(self._segment)
+        start = max(0, n - _CUT_SEARCH_FRAMES)
+        window = self._seg_rms[start:]
+        cut = start + int(np.argmin(window)) + 1  # keep the quiet frame in the head
+        head = b"".join(self._segment[:cut])
+        self._segment = self._segment[cut:]
+        self._seg_rms = self._seg_rms[cut:]
+        return head
 
     # ── vectorized block preprocessing ───────────────────────────────────────
     def _preprocess_block_array(
@@ -289,10 +331,12 @@ class FastVAD:
             if is_speech:
                 if not self._in_speech:
                     self._segment = list(self._preroll) + [fb]
+                    self._seg_rms = [0.0] * len(self._preroll) + [rms]
                     self._in_speech = True
                     self._sil_count = 0
                 else:
                     self._segment.append(fb)
+                    self._seg_rms.append(rms)
                     self._sil_count = 0
                 self._preroll.append(fb)
                 if len(self._preroll) > _PREROLL:
@@ -300,6 +344,7 @@ class FastVAD:
             else:
                 if self._in_speech:
                     self._segment.append(fb)
+                    self._seg_rms.append(rms)
                     self._sil_count += 1
                     if self._sil_count >= self._end_silence_frames:
                         # Only dispatch segments long enough to contain real speech.
@@ -307,12 +352,20 @@ class FastVAD:
                         if len(self._segment) >= _MIN_DISPATCH_FRAMES:
                             segments.append(b"".join(self._segment))
                         self._segment = []
+                        self._seg_rms = []
                         self._in_speech = False
                         self._sil_count = 0
                 else:
                     self._preroll.append(fb)
                     if len(self._preroll) > _PREROLL:
                         self._preroll.pop(0)
+
+            if (
+                self._in_speech
+                and self._max_segment_frames
+                and len(self._segment) >= self._max_segment_frames
+            ):
+                segments.append(self._cut_long_segment())
 
         self._leftover = tail
         return segments

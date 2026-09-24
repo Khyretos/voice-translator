@@ -112,3 +112,47 @@ Try, in roughly this order of impact:
 4. If a specific phrase keeps recurring that isn't in the denylist, it's a
    short, easy addition to `_WHISPER_HALLUCINATIONS` or the prefix lists in
    `recognizers.py` — happy to add it if you tell me what it is.
+
+## Live latency (Whisper)
+
+For a live conversation tool the old Whisper pipeline had three problems:
+
+1. **Nothing was sent until you paused.** A segment was only dispatched
+   after `End-of-speech pause` of silence, so 20 s of continuous talking
+   meant 20 s with no captions, then one big slow request.
+2. **Old audio piled up.** Up to 3 requests ran in parallel and anything
+   beyond that was dropped; on a server slower than real time results came
+   back out of order, chunks went missing, and captions drifted further and
+   further behind what was being said.
+3. **Beam search by default** (beam 5 / best-of 5), several times slower per
+   request than greedy decoding on most servers.
+
+Now (all in the Whisper settings under **Live mode**):
+
+- **Max segment length** (default 6 s): continuous speech is cut into
+  pieces at the quietest point in the last second, so text appears while
+  you're still talking.
+- **Live partial captions**: roughly every 0.8 s the sentence so far is
+  sent for a best-guess preview — only when the server is otherwise idle,
+  and discarded if the final arrives first, so it never delays real text.
+- **One ordered request at a time** (`live_whisper.py`): segments finished
+  while a request is in flight are merged into the next request instead of
+  queueing, so however slow the server, at most one request is waiting and
+  results arrive in speaking order. If the server can't keep up at all,
+  audio older than ~12 s is skipped (logged as a warning) so the captions
+  jump to the present instead of lagging further.
+- **Low-latency decoding** (on by default): greedy decoding, overriding the
+  Beam size / Best of sliders. Turn it off to use those sliders again.
+- Translation no longer holds back the recognized text: in instant subtitle
+  mode the recognized line shows immediately and the translation fills in
+  when it's ready. The Whisper-translate client is reused between lines so
+  its connection stays open.
+- Server-side, if audio processing ever falls more than ~3 s behind the
+  incoming audio, the oldest blocks are dropped (logged) rather than
+  processed late. The browser also stops sending when ~1 s of audio is
+  already waiting on a slow connection.
+
+The debug log shows each request as `Whisper final: 2.8s audio in 0.41s`.
+If that second number is regularly larger than the first, the Whisper server
+itself is slower than real time (e.g. a large model on CPU) — a smaller model
+(`small`, `medium`, `large-v3-turbo`) or a GPU is the fix there.

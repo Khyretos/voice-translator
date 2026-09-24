@@ -43,8 +43,9 @@ class TestSanitizeSlug:
 class FakeRequest:
     """Mimics the subset of gr.Request that get_slug() touches."""
 
-    def __init__(self, session_hash="fallback-hash"):
+    def __init__(self, session_hash="fallback-hash", referer=None):
         self.session_hash = session_hash
+        self.headers = {"referer": referer} if referer else {}
 
 
 class TestRegisterAndGetSlug:
@@ -53,9 +54,32 @@ class TestRegisterAndGetSlug:
         register_slug("hash-1", "khyretos")
         assert get_slug(req) == "khyretos"
 
-    def test_unregistered_hash_falls_back_to_hash_itself(self):
+    def test_unregistered_hash_falls_back_to_default_not_the_hash(self):
+        # Falling back to the raw hash used to create an unnamed ghost
+        # session that Start/Stop/settings then silently operated on.
         req = FakeRequest(session_hash="never-registered-hash")
-        assert get_slug(req) == "never-registered-hash"
+        assert get_slug(req) == DEFAULT_SLUG
+
+    def test_unregistered_hash_recovers_slug_from_referer_query(self):
+        req = FakeRequest(
+            session_hash="restarted-server-hash",
+            referer="https://vt.example.com/?session=khyretos",
+        )
+        assert get_slug(req) == "khyretos"
+        # ...and re-registers it, so later calls don't depend on the header.
+        assert get_slug(FakeRequest(session_hash="restarted-server-hash")) == "khyretos"
+
+    def test_unregistered_hash_recovers_slug_from_pretty_path(self):
+        req = FakeRequest(
+            session_hash="pretty-path-hash", referer="https://vt.example.com/discord"
+        )
+        assert get_slug(req) == "discord"
+
+    def test_reserved_path_in_referer_is_not_a_slug(self):
+        req = FakeRequest(
+            session_hash="reserved-hash", referer="https://vt.example.com/gradio_api/x"
+        )
+        assert get_slug(req) == DEFAULT_SLUG
 
     def test_register_sanitizes_the_slug(self):
         register_slug("hash-2", "weird!!chars")
@@ -72,8 +96,8 @@ class TestRegisterAndGetSlug:
         req = FakeRequest(session_hash="hash-4")
         assert get_slug(req) == "temp-session"
         forget_session_hash("hash-4")
-        # After forgetting, falls back to the raw hash (unregistered).
-        assert get_slug(req) == "hash-4"
+        # After forgetting, falls back to the default slug, never the raw hash.
+        assert get_slug(req) == DEFAULT_SLUG
 
 
 class TestMultiTabIsolation:

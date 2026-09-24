@@ -91,7 +91,20 @@ PERSISTABLE_KEYS = [
     "moonshine_language",
     "moonshine_cache_dir",
     "noise_filter_threshold",
+    # Session robustness / live latency (see SESSIONS.md, RECOGNITION_QUALITY.md)
+    "audio_watchdog_seconds",
+    "whisper_low_latency",
+    "whisper_interim",
+    "whisper_max_segment_s",
+    # Popout/OBS URL id — persisted so an OBS browser source keeps working
+    # across restarts and after changing it.
+    "popout_id",
 ]
+
+# Keys that identify one specific session and must never be copied into a
+# *different* session when it's seeded from main's settings. Two sessions
+# sharing a popout_id would fight over the same OBS URL.
+SESSION_UNIQUE_KEYS = ("popout_id",)
 
 _settings_save_timers: dict[str, threading.Timer] = {}
 _settings_save_lock = threading.Lock()
@@ -146,6 +159,8 @@ def load_saved_settings(slug: str) -> dict:
             if main_path.exists():
                 with open(main_path, "r") as f:
                     data = _migrate_vad_threshold_in_place(json.load(f))
+                    for key in SESSION_UNIQUE_KEYS:
+                        data.pop(key, None)
                     print(
                         f"[SETTINGS] No settings file for '{slug}' yet — seeding "
                         f"from the current '{DEFAULT_SLUG}' session's settings"
@@ -155,6 +170,8 @@ def load_saved_settings(slug: str) -> dict:
         if SETTINGS_FILE.exists():
             with open(SETTINGS_FILE, "r") as f:
                 data = _migrate_vad_threshold_in_place(json.load(f))
+                for key in SESSION_UNIQUE_KEYS:
+                    data.pop(key, None)
                 print(
                     f"[SETTINGS] No settings file for '{slug}' yet — seeding from "
                     f"legacy {SETTINGS_FILE}"
@@ -186,3 +203,22 @@ def _write_settings(slug: str, data: dict):
             json.dump(data, f, indent=2)
     except Exception as e:
         print(f"[WARNING] Could not save settings for '{slug}': {e}")
+
+
+def find_slug_by_popout_id(popout_id: str) -> str | None:
+    """
+    Find which saved session owns `popout_id`, by scanning the per-slug
+    settings files. Lets /popout/<id> work straight after a server restart,
+    before anyone has opened that session's UI to load it into memory —
+    which is exactly the state an OBS browser source reconnects in.
+    """
+    if not popout_id or not SETTINGS_DIR.exists():
+        return None
+    for path in SETTINGS_DIR.glob("*.json"):
+        try:
+            with open(path, "r") as f:
+                if json.load(f).get("popout_id") == popout_id:
+                    return path.stem
+        except Exception:
+            continue
+    return None

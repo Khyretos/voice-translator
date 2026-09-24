@@ -145,3 +145,78 @@ session). After that, each slug saves independently to
   to `3600`.
 - WebSocket disconnects (tab closed, "stop streaming" clicked, brief network
   drop) no longer call `close_session` — they just stop feeding audio in.
+
+## Round 2: "the mic just stops", sessions that never stop, popout id lost
+
+### The mic stream stopping after a "refresh"
+
+Three separate causes, all fixed:
+
+- **Gradio's `unload` isn't only "tab closed".** Gradio fires it whenever
+  the tab's heartbeat connection drops — a Wi-Fi blip, the laptop waking
+  from sleep, a reverse proxy recycling the connection. The tab then
+  reconnects with the same `session_hash`, but the unload handler had
+  already *forgotten* that hash's slug, so `get_slug()` fell back to the
+  raw hash: from then on Start/Stop and every settings change went to an
+  unnamed ghost session. The mapping is now kept (the registry is bounded
+  by size instead), and if a hash is ever unknown (e.g. after a server
+  restart) the slug is recovered from the page URL in the `Referer` header
+  — the page now always keeps `?session=<name>` in the address bar — and
+  otherwise falls back to `main`, never to the raw hash.
+- **The display was updated by a `gr.Timer(0.05)`** — 20 Gradio queue
+  events per second per tab, through the same connection as every click.
+  Anything that slowed that connection built a backlog that made the page
+  stall and reconnect. The display, recognized/translated boxes and logs
+  are now polled by plain `fetch()` calls to `/display_data` and
+  `/logs_data`, outside Gradio's queue.
+- **The audio WebSocket never reconnected**, and audio was captured with a
+  `ScriptProcessorNode` on the page's main thread. Any socket drop ended
+  streaming for good while the server session kept "running". Capture now
+  runs in an `AudioWorklet` (its own audio thread) and the socket
+  reconnects automatically with backoff. Audio produced while disconnected
+  is dropped rather than replayed late.
+
+After a page reload, a running **Browser Microphone** session re-attaches
+the mic automatically (if the browser paused audio, the status box asks for
+one click anywhere on the page). **Tab/System Audio** can't be re-shared
+without you picking the tab again — the status says to press ▶️ Start,
+which on a running session simply re-attaches the audio.
+
+Only one tab streams into a session at a time: if you open the same session
+in a second tab and start audio there, the first tab is told it was
+replaced and stops, instead of both feeding the same recognizer.
+
+### Audio watchdog: no source → session stops
+
+A running session now stops by itself when its audio source is gone,
+with the reason shown in the Status box of every open tab:
+
+- **Browser mic unplugged / permission revoked / "Stop sharing" clicked:**
+  the page sees its track end and stops the session immediately.
+- **Browser audio stops arriving** (tab closed, browser crashed, network
+  down for longer than a blip): stopped after *Auto-stop when audio is
+  lost* seconds (Audio section, default 8). The page streams continuously,
+  silence included, so a silent room doesn't trigger this; a start gets 30 s
+  of grace for the permission prompt / screen-share picker.
+- **Server Audio Device unplugged:** PortAudio calls back every 30 ms even
+  in silence, so no callbacks for 3 s (or the stream going inactive) stops
+  the session. One limitation: a device that keeps delivering pure digital
+  silence after being unplugged can't be told apart from a virtual/loopback
+  device with nothing playing, so that case isn't auto-stopped.
+
+Set the slider to 0 to never auto-stop. This replaces the earlier "nothing
+ever stops a running session" rule, which kept sessions alive with no audio
+at all.
+
+### Popout id is saved
+
+The popout id is part of the session's saved settings (`popout_id` in
+`settings/<slug>.json`), so an OBS browser source URL keeps working across
+restarts. Change it by typing in *Custom Popout ID* and pressing Enter or
+clicking away; the Status box confirms it was saved. Ids are unique per
+session (a new session never inherits `main`'s id, and an id already used by
+another session is refused). `/popout/<id>` also works straight after a
+server restart, before anyone reopened that session's page — it loads the
+session from disk. The popout polls every 150 ms (was 500 ms), and the
+Popout URL shown in the UI uses the address you opened the page with
+instead of the `0.0.0.0` bind address.

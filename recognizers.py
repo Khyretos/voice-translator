@@ -372,7 +372,7 @@ class WhisperRecognizer:
             kept.append(text)
         return " ".join(kept)
 
-    def transcribe(self, audio_bytes, sample_rate=16000, language=None):
+    def transcribe(self, audio_bytes, sample_rate=16000, language=None, timeout=30):
         try:
             buffer = io.BytesIO()
             with wave.open(buffer, "wb") as wf:
@@ -384,7 +384,7 @@ class WhisperRecognizer:
             files = {"file": ("audio.wav", buffer, "audio/wav")}
             data = self._build_data(language=language, task="transcribe")
             url = self.endpoint_url or f"{self.host}/audio/transcriptions"
-            response = self.session.post(url, files=files, data=data, timeout=30)
+            response = self.session.post(url, files=files, data=data, timeout=timeout)
             if response.status_code == 200:
                 return self._extract_text(response.json())
             else:

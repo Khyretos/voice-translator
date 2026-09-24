@@ -1,5 +1,9 @@
 # Core web UI and server
 gradio
+# WebSocket support for uvicorn — browser mic/tab audio streams over /ws/.
+# Recent Gradio releases no longer pull this in, and without it every audio
+# WebSocket is rejected with a 404.
+websockets
 
 # Speech recognition
 vosk

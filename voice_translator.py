@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import gc
 import json
 import os
@@ -16,6 +17,7 @@ import sounddevice as sd
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from vosk import KaldiRecognizer, Model
 
@@ -35,14 +37,19 @@ from recognizers import (
     is_whisper_hallucination,
 )
 from vad import FastVAD, _WRTCVAD_AVAILABLE
+from live_whisper import LiveWhisperWorker
 from subtitles import SubtitleManager
 from session import (
     SessionSlugMiddleware,
-    forget_session_hash,
     get_slug,
     register_slug,
 )
-from settings_store import SETTINGS_DIR, load_saved_settings, persist_settings
+from settings_store import (
+    SETTINGS_DIR,
+    find_slug_by_popout_id,
+    load_saved_settings,
+    persist_settings,
+)
 
 if ARGOS_AVAILABLE:
     # Needed directly (not just via ArgosTranslator) for the Argos settings
@@ -62,6 +69,19 @@ SESSION_LOCK = threading.Lock()
 # and per-slug settings persistence (load_saved_settings, persist_settings,
 # PERSISTABLE_KEYS, SETTINGS_DIR) now live in session.py / settings_store.py
 # — imported above. See SESSIONS.md.
+
+# ── Live-pipeline tuning ──────────────────────────────────────────────────────
+# Whisper interim captions: at most one partial request per interval, and
+# only once the utterance has enough audio for a meaningful guess.
+_INTERIM_INTERVAL_S = 0.8
+_INTERIM_MIN_AUDIO_MS = 800
+# If audio processing falls this far behind (blocks are 30–40 ms), drop the
+# oldest blocks instead of transcribing ever-older audio.
+_AUDIO_BACKLOG_MAX_BLOCKS = 100  # ~3–4 s
+_AUDIO_BACKLOG_KEEP_BLOCKS = 10
+# Audio watchdog (see VoiceTranslatorApp.check_audio_watchdog)
+_HW_WATCHDOG_MAX_S = 3.0  # a server device calls back every 30 ms, even in silence
+_BROWSER_START_GRACE_S = 30.0  # time for the mic prompt / screen-share picker
 
 # ── Font helpers ──────────────────────────────────────────────────────────────
 def get_available_fonts():
@@ -87,22 +107,47 @@ SYSTEM_FONTS = [
 ]
 
 # ── Browser-side JavaScript ───────────────────────────────────────────────────
-js = """
+js = r"""
 <script>
+// ─────────────────────────────────────────────────────────────────────────────
+// Browser side of the app. Everything here talks to the server with plain
+// fetch()/WebSocket calls, never through Gradio's event queue, so a slow or
+// briefly-dropped Gradio connection can't stall the display or cut the audio.
+//
+//  • Audio capture runs in an AudioWorklet (its own audio thread), resampled
+//    to 16 kHz there and sent in 40 ms chunks. The old ScriptProcessorNode ran
+//    on the page's main thread and dropped audio whenever the page was busy.
+//  • The audio WebSocket reconnects by itself after a network blip.
+//  • If the mic is unplugged / the tab share is stopped, the session is
+//    stopped on the server immediately (see vtSourceLost). The server also
+//    has its own watchdog for when this page can't tell it (tab closed).
+//  • After a page reload, a running browser-mic session re-attaches the mic
+//    automatically.
+// ─────────────────────────────────────────────────────────────────────────────
 window.__audioStreamActive = false;
-window.__audioProcessor = null;
-window.__audioSource = null;
-window.__mediaStream = null;
-window.__audioContext = null;
-window.__websocket = null;
-window.__volumeMeterInterval = null;
-window.__hwLevelInterval = null;   // hardware mic polling
-window.__micTestActive = false;    // mic test (monitor) mode
+window.__micTestActive = false;
+window.__hwLevelInterval = null;
+window.__lastVolume = 0;
 
-function setStatus(text) {
-    var status = document.getElementById('browser-status');
-    if (status) status.value = text;
+var VT = window.VT = {
+    capture: null,      // {stream, ctx, source, node, sink, sourceType, closed, onLost}
+    ws: null,
+    wsTimer: null,
+    wsBackoff: 500,
+    wantStream: false,
+    meterTimer: null,
+    lastRunning: null,
+    resumeTried: false,
+};
+
+function vtSetBox(elemId, text) {
+    var el = document.querySelector('#' + elemId + ' textarea, #' + elemId + ' input');
+    if (el && el.value !== text) el.value = text;
 }
+function setStatus(text) { vtSetBox('browser-status', text); }
+function setMainStatus(text) { vtSetBox('status-text', text); }
+function vtSessionData() { return document.getElementById('session-data'); }
+function vtSession() { var d = vtSessionData(); return d ? d.dataset.session : null; }
 
 // Peak-hold state: the highest dB seen in the last PEAK_HOLD_MS milliseconds.
 var peakDb = -60;
@@ -159,7 +204,6 @@ function updateVolumeMeter(rmsLevel) {
         peakDb = db;
         if (peakHoldTimer) clearTimeout(peakHoldTimer);
         peakHoldTimer = setTimeout(function() {
-            // Decay peak over 1 s after hold period
             peakDb = -60;
             if (peakLine) peakLine.style.left = '0%';
         }, PEAK_HOLD_MS);
@@ -170,21 +214,37 @@ function updateVolumeMeter(rmsLevel) {
     }
 }
 
-document.addEventListener('DOMContentLoaded', function() {
-    var slider = document.querySelector('#vad-threshold-slider input[type="range"]');
-    if (slider) {
-        slider.addEventListener('input', function() {
-            updateVolumeMeter(window.__lastVolume || 0);
-        });
+// Gradio may inject this script after DOMContentLoaded has already fired
+// (and renders its components later still), so boot on a short retry loop
+// instead of relying on that event.
+function vtWhenReady(fn) {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', fn);
+    } else {
+        fn();
     }
+}
+
+vtWhenReady(function() {
+    var tries = 0;
+    var t = setInterval(function() {
+        var slider = document.querySelector('#vad-threshold-slider input[type="range"]');
+        if (slider) {
+            clearInterval(t);
+            slider.addEventListener('input', function() {
+                updateVolumeMeter(window.__lastVolume || 0);
+            });
+        } else if (++tries > 300) {
+            clearInterval(t);
+        }
+    }, 100);
 });
 
 // ── Hardware mic level polling ─────────────────────────────────────────────
 window.startHwLevelPolling = function() {
     if (window.__hwLevelInterval) return;
-    var sessionDiv = document.getElementById('session-data');
-    if (!sessionDiv) return;
-    var session = sessionDiv.dataset.session;
+    var session = vtSession();
+    if (!session) return;
     window.__hwLevelInterval = setInterval(function() {
         fetch('/mic_level/' + session)
             .then(function(r) { return r.json(); })
@@ -204,51 +264,114 @@ window.stopHwLevelPolling = function() {
 // ── Audio source detection ─────────────────────────────────────────────────
 // Mirrors whichever "Audio Source" radio option is currently checked.
 window.__getAudioSourceType = function() {
-    var micRadio = document.querySelector('input[value="browser_mic"]');
     var dispRadio = document.querySelector('input[value="browser_display"]');
     if (dispRadio && dispRadio.checked) return 'display';
-    if (micRadio && micRadio.checked) return 'mic';
     return 'mic';
 };
-
-// ── Browser streaming (full: recognition + meter) ─────────────────────────
-window.startBrowserStreaming = function() {
+function vtBrowserModeSelected() {
     var micRadio = document.querySelector('input[value="browser_mic"]');
     var dispRadio = document.querySelector('input[value="browser_display"]');
-    var isBrowserMode = (micRadio && micRadio.checked) || (dispRadio && dispRadio.checked);
-    if (!isBrowserMode) return;
-    if (window.__audioStreamActive) return;
-    window.__audioStreamActive = true;
-    window.__startAudioCapture(true, window.__getAudioSourceType());
-};
+    return (micRadio && micRadio.checked) || (dispRadio && dispRadio.checked);
+}
 
-// ── Browser mic test (meter only, no WebSocket) ───────────────────────────
-window.startBrowserMicTest = function() {
-    if (window.__audioStreamActive || window.__micTestActive) return;
-    window.__micTestActive = true;
-    window.__startAudioCapture(false, window.__getAudioSourceType());
-};
+// ── 16 kHz resampler (shared by the AudioWorklet and the fallback path) ─────
+// Streaming linear interpolation with the fractional position carried across
+// blocks (the old per-block resampler restarted its phase on every block,
+// adding a small glitch each time), after a short moving-average low-pass to
+// limit aliasing. Emits 40 ms Int16 chunks plus the peak 10 ms-frame RMS
+// (exactly what the server VAD measures) for the level meter.
+var VT_RESAMPLER_SRC = `
+class VTResampler {
+    constructor(inRate) {
+        this.ratio = inRate / 16000;
+        this.t = 0;
+        this.prev = 0;
+        this.taps = Math.max(1, Math.min(8, Math.round(this.ratio)));
+        this.hist = new Float32Array(this.taps);
+        this.hi = 0;
+        this.sum = 0;
+        this.scratch = null;
+        this.out = new Int16Array(640);
+        this.n = 0;
+        this.frameAcc = 0;
+        this.frameN = 0;
+        this.peak = 0;
+    }
+    push(input, emit) {
+        var L = input.length;
+        if (L < 2) return;
+        var x = input;
+        if (this.taps > 1) {
+            if (!this.scratch || this.scratch.length !== L) this.scratch = new Float32Array(L);
+            x = this.scratch;
+            for (var i = 0; i < L; i++) {
+                this.sum += input[i] - this.hist[this.hi];
+                this.hist[this.hi] = input[i];
+                this.hi = (this.hi + 1) % this.taps;
+                if (this.hi === 0) {  // re-sum now and then so float error can't drift
+                    var s = 0;
+                    for (var k = 0; k < this.taps; k++) s += this.hist[k];
+                    this.sum = s;
+                }
+                x[i] = this.sum / this.taps;
+            }
+        }
+        var t = this.t;
+        while (t < L - 1) {
+            var i1 = Math.floor(t);
+            var f = t - i1;
+            var a = i1 < 0 ? this.prev : x[i1];
+            var v = a + (x[i1 + 1] - a) * f;
+            if (v > 1) v = 1; else if (v < -1) v = -1;
+            this.out[this.n++] = v < 0 ? v * 32768 : v * 32767;
+            this.frameAcc += v * v;
+            if (++this.frameN === 160) {
+                var r = Math.sqrt(this.frameAcc / 160);
+                if (r > this.peak) this.peak = r;
+                this.frameAcc = 0;
+                this.frameN = 0;
+            }
+            if (this.n === this.out.length) {
+                emit(this.out.slice(0), this.peak);
+                this.n = 0;
+                this.peak = 0;
+            }
+            t += this.ratio;
+        }
+        this.t = t - L;
+        this.prev = x[L - 1];
+    }
+}
+`;
 
-window.stopBrowserMicTest = function() {
-    if (!window.__micTestActive) return;
-    window.__micTestActive = false;
-    window.__stopAudioCapture();
-};
+var VT_WORKLET_SRC = VT_RESAMPLER_SRC + `
+class VTCaptureProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        var port = this.port;
+        this.rs = new VTResampler(sampleRate);
+        this.emit = function(pcm, peak) { port.postMessage({ pcm: pcm.buffer, peak: peak }, [pcm.buffer]); };
+    }
+    process(inputs) {
+        var ch = inputs[0] && inputs[0][0];
+        if (ch) this.rs.push(ch, this.emit);
+        return true;
+    }
+}
+registerProcessor('vt-capture', VTCaptureProcessor);
+`;
 
-// ── Core audio capture (shared) ───────────────────────────────────────────
+var VTResamplerMain = (new Function(VT_RESAMPLER_SRC + '; return VTResampler;'))();
+
+// ── Capture (shared by streaming and the mic test) ─────────────────────────
 // sourceType: 'mic' (getUserMedia, this device's microphone) or 'display'
 // (getDisplayMedia — a shared browser tab/window/screen, with its audio —
 // e.g. a Discord web tab, or on Windows/ChromeOS, whole-system audio).
-window.__startAudioCapture = function(withWs, sourceType) {
-    sourceType = sourceType || 'mic';
-    var sessionDiv = document.getElementById('session-data');
-    if (!sessionDiv) { setStatus('Error: session data missing'); window.__audioStreamActive = false; window.__micTestActive = false; return; }
-
-    var mediaPromise;
+function vtGetMedia(sourceType) {
     if (sourceType === 'display') {
         // video:true is required by the getDisplayMedia spec even though we
         // discard the track immediately below — only the audio is used.
-        mediaPromise = navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
+        return navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
             .then(function(stream) {
                 stream.getVideoTracks().forEach(function(t) { stream.removeTrack(t); t.stop(); });
                 if (stream.getAudioTracks().length === 0) {
@@ -257,139 +380,375 @@ window.__startAudioCapture = function(withWs, sourceType) {
                 }
                 return stream;
             });
-    } else {
-        mediaPromise = navigator.mediaDevices.getUserMedia({ audio: true });
     }
+    return navigator.mediaDevices.getUserMedia({ audio: true });
+}
 
-    mediaPromise
-        .then(function(stream) {
-            window.__mediaStream = stream;
-            var AudioContext = window.AudioContext || window.webkitAudioContext;
-            window.__audioContext = new AudioContext();
-            var inputSampleRate = window.__audioContext.sampleRate;
-            window.__audioSource = window.__audioContext.createMediaStreamSource(stream);
-            window.__audioProcessor = window.__audioContext.createScriptProcessor(4096, 1, 1);
-            window.__audioSource.connect(window.__audioProcessor);
-            window.__audioProcessor.connect(window.__audioContext.destination);
+async function vtOpenCapture(sourceType, onChunk) {
+    var stream = await vtGetMedia(sourceType);
+    var AC = window.AudioContext || window.webkitAudioContext;
+    var ctx = new AC({ latencyHint: 'interactive' });
+    var source = ctx.createMediaStreamSource(stream);
+    // Muted sink: keeps the graph pulling audio without playing it back.
+    var sink = ctx.createGain();
+    sink.gain.value = 0;
+    sink.connect(ctx.destination);
+    var node = null;
+    if (ctx.audioWorklet && window.AudioWorkletNode) {
+        try {
+            var url = URL.createObjectURL(new Blob([VT_WORKLET_SRC], { type: 'application/javascript' }));
+            await ctx.audioWorklet.addModule(url);
+            URL.revokeObjectURL(url);
+            node = new AudioWorkletNode(ctx, 'vt-capture', {
+                numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1]
+            });
+            node.port.onmessage = function(e) { onChunk(e.data.pcm, e.data.peak); };
+        } catch (err) {
+            console.warn('[VT] AudioWorklet unavailable, using ScriptProcessor', err);
+            node = null;
+        }
+    }
+    if (!node) {
+        var rs = new VTResamplerMain(ctx.sampleRate);
+        node = ctx.createScriptProcessor(2048, 1, 1);
+        node.onaudioprocess = function(e) {
+            rs.push(e.inputBuffer.getChannelData(0), function(pcm, peak) { onChunk(pcm.buffer, peak); });
+        };
+    }
+    source.connect(node);
+    node.connect(sink);
+    return { stream: stream, ctx: ctx, source: source, node: node, sink: sink,
+             sourceType: sourceType, closed: false, onLost: null };
+}
 
-            if (withWs) {
-                var wsPath = sessionDiv.dataset.wsPath;
-                var wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                window.__websocket = new WebSocket(wsProtocol + '//' + window.location.host + wsPath);
-                window.__websocket.binaryType = 'arraybuffer';
-                window.__websocket.onopen  = function() { setStatus('Streaming...'); };
-                window.__websocket.onerror = function() { setStatus('WebSocket error'); window.stopBrowserStreaming(); };
-                window.__websocket.onclose = function() { setStatus('Stopped'); window.__audioStreamActive = false; updateVolumeMeter(0); };
-            } else {
-                setStatus('Mic test active...');
-            }
+function vtCloseCapture(cap) {
+    if (!cap || cap.closed) return;
+    cap.closed = true;
+    try { if (cap.node.port) cap.node.port.onmessage = null; } catch (e) {}
+    try { cap.node.onaudioprocess = null; } catch (e) {}
+    try { cap.source.disconnect(); } catch (e) {}
+    try { cap.node.disconnect(); } catch (e) {}
+    cap.stream.getTracks().forEach(function(t) { t.onended = null; try { t.stop(); } catch (e) {} });
+    try { cap.ctx.onstatechange = null; cap.ctx.close(); } catch (e) {}
+}
 
-            if (window.__volumeMeterInterval) clearInterval(window.__volumeMeterInterval);
-            window.__volumeMeterInterval = setInterval(function() {
-                if (window.__lastVolume !== undefined) updateVolumeMeter(window.__lastVolume);
-            }, 80);
+// Detect the source going away, and keep the AudioContext running.
+function vtWatchCapture(cap) {
+    cap.stream.getAudioTracks().forEach(function(t) {
+        t.onended = function() {
+            if (cap.onLost) cap.onLost(cap.sourceType === 'display' ? 'sharing stopped' : 'microphone disconnected');
+        };
+    });
+    cap.ctx.onstatechange = function() { vtEnsureRunning(cap); };
+    vtEnsureRunning(cap);
+}
 
-            window.__audioProcessor.onaudioprocess = function(e) {
-                var inputData = e.inputBuffer.getChannelData(0);
+function vtEnsureRunning(cap) {
+    if (!cap || cap.closed) return;
+    var st = cap.ctx.state;
+    if (st === 'running') {
+        if (VT.pausedMsg) { VT.pausedMsg = false; setStatus(VT.wantStream ? 'Streaming...' : 'Mic test active...'); }
+        return;
+    }
+    if (st === 'closed') return;
+    // 'suspended' / 'interrupted': the browser paused audio (autoplay policy
+    // after a reload, OS audio interruption, …). Try to resume; if that needs
+    // a user gesture, ask for one.
+    cap.ctx.resume().catch(function() {});
+    setTimeout(function() {
+        if (cap.closed || cap.ctx.state === 'running') return;
+        VT.pausedMsg = true;
+        setStatus('⏸ The browser paused audio capture — click anywhere on this page to resume');
+        var resume = function() {
+            document.removeEventListener('pointerdown', resume, true);
+            document.removeEventListener('keydown', resume, true);
+            if (!cap.closed) cap.ctx.resume().catch(function() {});
+        };
+        document.addEventListener('pointerdown', resume, true);
+        document.addEventListener('keydown', resume, true);
+    }, 400);
+}
 
-                // Resample to 16 kHz if needed
-                var outputData;
-                if (inputSampleRate !== 16000) {
-                    var ratio = 16000 / inputSampleRate;
-                    var outLen = Math.floor(inputData.length * ratio);
-                    outputData = new Float32Array(outLen);
-                    for (var i = 0; i < outLen; i++) {
-                        var pos = i / ratio;
-                        var i1 = Math.floor(pos), i2 = Math.min(i1 + 1, inputData.length - 1);
-                        outputData[i] = inputData[i1] * (1 - (pos - i1)) + inputData[i2] * (pos - i1);
-                    }
-                } else {
-                    outputData = inputData;
-                }
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener('devicechange', function() {
+        var cap = VT.capture;
+        if (!cap || cap.closed) return;
+        var tracks = cap.stream.getAudioTracks();
+        var dead = tracks.length === 0 || tracks.every(function(t) { return t.readyState === 'ended'; });
+        if (dead && cap.onLost) cap.onLost('microphone disconnected');
+    });
+}
+document.addEventListener('visibilitychange', function() {
+    if (!document.hidden && VT.capture) vtEnsureRunning(VT.capture);
+});
 
-                // Calculate PEAK RMS over 10 ms frames — exactly what the server VAD sees.
-                // (server uses blocksize=480 → 3 frames of 160 samples each at 16 kHz)
-                var frameSize = 160;  // 10 ms at 16 kHz
-                var peakRms = 0;
-                for (var f = 0; f + frameSize <= outputData.length; f += frameSize) {
-                    var s2 = 0;
-                    for (var i = f; i < f + frameSize; i++) s2 += outputData[i] * outputData[i];
-                    var frameRms = Math.sqrt(s2 / frameSize);
-                    if (frameRms > peakRms) peakRms = frameRms;
-                }
-                // Fallback: whole-block RMS if block is shorter than one frame
-                if (peakRms === 0) {
-                    var s2 = 0;
-                    for (var i = 0; i < outputData.length; i++) s2 += outputData[i] * outputData[i];
-                    peakRms = Math.sqrt(s2 / outputData.length);
-                }
-                window.__lastVolume = peakRms;
+// ── Level meter ────────────────────────────────────────────────────────────
+function vtNoteLevel(peak) {
+    if (!(peak <= window.__lastVolume)) window.__lastVolume = peak;
+}
+function vtStartMeter() {
+    if (VT.meterTimer) return;
+    VT.meterTimer = setInterval(function() {
+        updateVolumeMeter(window.__lastVolume || 0);
+        window.__lastVolume = 0;
+    }, 80);
+}
+function vtStopMeter() {
+    if (VT.meterTimer) { clearInterval(VT.meterTimer); VT.meterTimer = null; }
+    window.__lastVolume = 0;
+    updateVolumeMeter(0);
+}
 
-                // If streaming, send the resampled audio (already int16 conversion)
-                if (withWs && window.__websocket && window.__websocket.readyState === WebSocket.OPEN) {
-                    var int16 = new Int16Array(outputData.length);
-                    for (var i = 0; i < outputData.length; i++) {
-                        var s = Math.max(-1, Math.min(1, outputData[i]));
-                        int16[i] = Math.round(s < 0 ? s * 32768 : s * 32767);
-                    }
-                    window.__websocket.send(int16.buffer);
-                }
-            };
-        })
-        .catch(function(err) { setStatus((sourceType === 'display' ? 'Capture error: ' : 'Mic error: ') + err.message); window.__audioStreamActive = false; window.__micTestActive = false; });
+// ── Audio WebSocket (auto-reconnecting) ────────────────────────────────────
+function vtConnectWs() {
+    if (!VT.wantStream || VT.ws) return;
+    var d = vtSessionData();
+    if (!d || !d.dataset.wsPath) { VT.wsTimer = setTimeout(vtConnectWs, 250); return; }
+    var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var ws = new WebSocket(proto + '//' + window.location.host + d.dataset.wsPath);
+    ws.binaryType = 'arraybuffer';
+    VT.ws = ws;
+    ws.onopen = function() {
+        VT.wsBackoff = 500;
+        if (VT.capture) setStatus('Streaming...');
+    };
+    ws.onmessage = function(e) {
+        if (typeof e.data !== 'string') return;
+        var msg;
+        try { msg = JSON.parse(e.data); } catch (x) { return; }
+        if (msg.type === 'stopped') {
+            vtStopStreaming(msg.reason || 'Stopped');
+            if (msg.reason) setMainStatus(msg.reason);
+        } else if (msg.type === 'replaced') {
+            vtStopStreaming('Audio moved to another open tab of this session');
+        }
+    };
+    ws.onclose = function() {
+        if (VT.ws === ws) VT.ws = null;
+        if (!VT.wantStream) return;
+        // Network blip / proxy recycle / server restart: keep capturing and
+        // reconnect. Audio produced while disconnected is dropped, not
+        // buffered — a live tool shouldn't replay the past.
+        setStatus('Connection lost — reconnecting…');
+        clearTimeout(VT.wsTimer);
+        VT.wsTimer = setTimeout(vtConnectWs, VT.wsBackoff);
+        VT.wsBackoff = Math.min(VT.wsBackoff * 2, 5000);
+    };
+}
+
+function vtCloseWs() {
+    clearTimeout(VT.wsTimer);
+    var ws = VT.ws;
+    VT.ws = null;
+    if (ws) {
+        ws.onclose = null;
+        ws.onmessage = null;
+        try { ws.close(); } catch (e) {}
+    }
+}
+
+// ── Streaming ──────────────────────────────────────────────────────────────
+function vtStartStreaming(sourceType, auto) {
+    if (VT.wantStream) {
+        // Already streaming from this tab: just make sure the socket is up.
+        vtConnectWs();
+        return;
+    }
+    if (window.__micTestActive) window.stopBrowserMicTest();
+    VT.wantStream = true;
+    window.__audioStreamActive = true;
+    setStatus(sourceType === 'display'
+        ? 'Choose a tab/window/screen to share (tick "Share audio")…'
+        : 'Starting microphone…');
+    vtConnectWs();
+    vtOpenCapture(sourceType, function(buf, peak) {
+        vtNoteLevel(peak);
+        var ws = VT.ws;
+        // Only send when the socket keeps up: if ~1 s is already waiting in
+        // the send buffer, drop this chunk instead of letting audio pile up.
+        if (ws && ws.readyState === 1 && ws.bufferedAmount < 32000) ws.send(buf);
+    }).then(function(cap) {
+        if (!VT.wantStream) { vtCloseCapture(cap); return; }
+        VT.capture = cap;
+        cap.onLost = vtSourceLost;
+        vtWatchCapture(cap);
+        vtStartMeter();
+        if (VT.ws && VT.ws.readyState === 1) setStatus('Streaming...');
+    }).catch(function(err) {
+        VT.wantStream = false;
+        window.__audioStreamActive = false;
+        vtCloseWs();
+        var msg = (sourceType === 'display' ? 'Capture error: ' : 'Mic error: ') + ((err && err.message) || err);
+        if (auto) msg += ' — press ▶️ Start to reconnect the microphone';
+        setStatus(msg);
+        setMainStatus(msg);
+        // Nothing will stream, so don't leave the session running without a
+        // source. (After an automatic re-attach attempt the server's own
+        // watchdog handles it, giving you time to press Start.)
+        if (!auto) vtReportSourceEnded('could not open the audio source');
+    });
+}
+
+function vtStopStreaming(text) {
+    VT.wantStream = false;
+    window.__audioStreamActive = false;
+    vtCloseWs();
+    vtCloseCapture(VT.capture);
+    VT.capture = null;
+    vtStopMeter();
+    setStatus(text || 'Stopped');
+}
+
+function vtReportSourceEnded(why) {
+    var ws = VT.ws;
+    if (ws && ws.readyState === 1) {
+        try { ws.send(JSON.stringify({ type: 'source_ended', reason: why })); return; } catch (e) {}
+    }
+    var slug = vtSession();
+    if (slug) {
+        fetch('/session_stop/' + encodeURIComponent(slug) + '?reason=' + encodeURIComponent(why),
+              { method: 'POST', keepalive: true }).catch(function() {});
+    }
+}
+
+// The capture's track ended: mic unplugged, permission revoked, or
+// "Stop sharing" clicked. Stop the session right away.
+function vtSourceLost(why) {
+    if (!VT.wantStream) {
+        if (window.__micTestActive) {
+            window.stopBrowserMicTest();
+            setStatus('🔌 ' + why);
+        }
+        return;
+    }
+    vtReportSourceEnded(why);
+    VT.wantStream = false;
+    window.__audioStreamActive = false;
+    vtCloseCapture(VT.capture);
+    VT.capture = null;
+    vtStopMeter();
+    setTimeout(vtCloseWs, 500);  // let the source_ended message go out first
+    var msg = '🔌 Audio source lost (' + why + ') — session stopped';
+    setStatus(msg);
+    setMainStatus(msg);
+}
+
+// Called (as Gradio js=) when ▶️ Start is clicked, before the server starts.
+window.startBrowserStreaming = function() {
+    if (!vtBrowserModeSelected()) return;
+    vtStartStreaming(window.__getAudioSourceType(), false);
 };
 
-window.__stopAudioCapture = function() {
-    if (window.__audioProcessor)  { window.__audioProcessor.disconnect(); window.__audioProcessor = null; }
-    if (window.__audioSource)     { window.__audioSource.disconnect(); window.__audioSource = null; }
-    if (window.__mediaStream)     { window.__mediaStream.getTracks().forEach(function(t){t.stop();}); window.__mediaStream = null; }
-    if (window.__audioContext)    { window.__audioContext.close(); window.__audioContext = null; }
-    if (window.__websocket)       { window.__websocket.close(); window.__websocket = null; }
-    if (window.__volumeMeterInterval) { clearInterval(window.__volumeMeterInterval); window.__volumeMeterInterval = null; }
-    updateVolumeMeter(0);
+// Called after the server's start handler returns: if it failed, stop the
+// audio we started for it.
+window.vtAfterStart = function(status) {
+    if (typeof status === 'string' && status.indexOf('❌') === 0 && VT.wantStream) {
+        vtStopStreaming('Stopped');
+    }
 };
 
 window.stopBrowserStreaming = function() {
-    if (!window.__audioStreamActive) return;
-    window.__audioStreamActive = false;
-    window.__stopAudioCapture();
-    setStatus('Stopped');
+    if (!VT.wantStream && !VT.capture) return;
+    vtStopStreaming('Stopped');
 };
 
-// Note: tab close/reload used to call /deactivate here, which fully tore
-// down the session (unloaded models, stopped recognition). Sessions are now
-// permanent by default — closing this tab just stops this tab's audio
-// stream; the session itself stays alive until explicitly closed from the
-// "Manage Sessions" panel or reclaimed by the server's idle timeout.
+// ── Browser mic test (meter only, no WebSocket) ───────────────────────────
+window.startBrowserMicTest = function() {
+    if (VT.wantStream || window.__micTestActive) return;
+    window.__micTestActive = true;
+    vtOpenCapture(window.__getAudioSourceType(), function(buf, peak) { vtNoteLevel(peak); })
+        .then(function(cap) {
+            if (!window.__micTestActive) { vtCloseCapture(cap); return; }
+            VT.capture = cap;
+            cap.onLost = vtSourceLost;
+            vtWatchCapture(cap);
+            vtStartMeter();
+            setStatus('Mic test active...');
+        })
+        .catch(function(err) {
+            window.__micTestActive = false;
+            setStatus('Mic error: ' + ((err && err.message) || err));
+        });
+};
 
-// ── Display + Logs polling (bypasses Gradio SSE entirely) ────────────────
-// Both fetch directly from FastAPI endpoints. Zero Gradio SSE queue usage.
-// This prevents the page from ever reloading due to SSE queue pressure.
-window.__logsInterval    = null;
+window.stopBrowserMicTest = function() {
+    if (!window.__micTestActive) return;
+    window.__micTestActive = false;
+    if (!VT.wantStream) {
+        vtCloseCapture(VT.capture);
+        VT.capture = null;
+        vtStopMeter();
+    }
+};
+
+// ── Display + session-state polling ────────────────────────────────────────
+// Plain fetch() against /display_data (never through Gradio's queue). Also
+// carries the session's running state, so every open tab notices a stop —
+// including an automatic one when the audio source is lost — and a reloaded
+// page can re-attach its microphone.
+function vtRender(d) {
+    var box = document.getElementById('vt-display');
+    if (box && typeof d.html === 'string' && box.__vtHtml !== d.html) {
+        box.innerHTML = d.html;
+        box.__vtHtml = d.html;
+    }
+    vtSetBox('recognized-output-text', d.recognized || '');
+    vtSetBox('translated-output-text', d.translated || '');
+}
+
+function vtHandleState(d) {
+    if (typeof d.running !== 'boolean') return;
+    var browserMode = d.audio_mode === 'browser_mic' || d.audio_mode === 'browser_display';
+    if (VT.lastRunning === true && d.running === false) {
+        // Stopped — by Stop in this or another tab, or automatically.
+        if (VT.wantStream) vtStopStreaming(d.stop_reason || 'Stopped');
+        if (d.stop_reason) setMainStatus(d.stop_reason);
+    }
+    if (VT.lastRunning === null && d.running && browserMode && !VT.wantStream && !d.audio_client) {
+        vtAutoResume(d.audio_mode);
+    }
+    VT.lastRunning = d.running;
+}
+
+function vtAutoResume(mode) {
+    if (VT.resumeTried) return;
+    VT.resumeTried = true;
+    if (mode === 'browser_display') {
+        var m = '⚠️ This session is running, but the page was reloaded so tab/screen ' +
+                'sharing ended. Press ▶️ Start to share again.';
+        setStatus(m);
+        setMainStatus(m);
+        return;
+    }
+    setStatus('Page reloaded — reconnecting the microphone…');
+    vtStartStreaming('mic', true);
+}
+
+function vtPoll() {
+    var slug = vtSession();
+    if (!slug) { VT.pollTimer = setTimeout(vtPoll, 250); return; }
+    fetch('/display_data/' + encodeURIComponent(slug), { cache: 'no-store' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) { vtRender(d); vtHandleState(d); })
+        .catch(function() {})
+        .finally(function() {
+            // Slow down while the tab is hidden; the session itself is unaffected.
+            VT.pollTimer = setTimeout(vtPoll, document.hidden ? 1000 : 100);
+        });
+}
+
+// ── Logs polling ───────────────────────────────────────────────────────────
+window.__logsInterval = null;
 
 window.startAllPolling = function() {
-    var sessionDiv = document.getElementById('session-data');
-    if (!sessionDiv || !sessionDiv.dataset.session) return false;
-    var session = sessionDiv.dataset.session;
-
-    // Logs polling only (display is now handled by Gradio timer)
+    var session = vtSession();
+    if (!session) return false;
+    if (!VT.pollTimer) vtPoll();
     if (!window.__logsInterval) {
         window.__logsInterval = setInterval(function() {
             fetch('/logs_data/' + session)
                 .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    var el = document.querySelector('textarea[elem_id="log_output"], #log_output textarea');
-                    if (!el) {
-                        var labels = document.querySelectorAll('label');
-                        for (var i = 0; i < labels.length; i++) {
-                            if (labels[i].textContent.trim() === 'Log') {
-                                var ta = labels[i].closest('.block') && labels[i].closest('.block').querySelector('textarea');
-                                if (ta) { el = ta; break; }
-                            }
-                        }
-                    }
-                    if (el && d.logs !== undefined) el.value = d.logs;
-                })
+                .then(function(d) { if (d.logs !== undefined) vtSetBox('log_output', d.logs); })
                 .catch(function() {});
         }, 2000);
     }
@@ -397,22 +756,14 @@ window.startAllPolling = function() {
 };
 
 window.stopAllPolling = function() {
-    if (window.__displayInterval) { clearInterval(window.__displayInterval); window.__displayInterval = null; }
-    if (window.__logsInterval)    { clearInterval(window.__logsInterval);    window.__logsInterval    = null; }
+    if (VT.pollTimer) { clearTimeout(VT.pollTimer); VT.pollTimer = null; }
+    if (window.__logsInterval) { clearInterval(window.__logsInterval); window.__logsInterval = null; }
 };
 
 // Start polling as soon as Gradio has injected the session-data div.
-// Use a brief retry loop — Gradio renders async, typically < 500ms.
-document.addEventListener('DOMContentLoaded', function() {
-    var attempts = 0;
+vtWhenReady(function() {
     var boot = setInterval(function() {
-        attempts++;
-        if (window.startAllPolling()) {
-            clearInterval(boot);
-        } else if (attempts > 50) {
-            // Give up after 5 s — Gradio took too long to inject session div
-            clearInterval(boot);
-        }
+        if (window.startAllPolling()) clearInterval(boot);
     }, 100);
 });
 </script>
@@ -518,6 +869,15 @@ class VoiceTranslatorApp:
         "subtitle_cps": 21,  # characters per second
         "subtitle_max_lines": 2,  # sentences per chunk in buffered mode
         "noise_filter_threshold": 0.0,
+        # Auto-stop a running session when its audio source goes away: a
+        # server device that stops delivering audio (unplugged), or a
+        # browser mic/tab stream that stops arriving. 0 disables. See
+        # SESSIONS.md → "Audio watchdog".
+        "audio_watchdog_seconds": 8,
+        # Whisper live mode (see RECOGNITION_QUALITY.md → "Live latency")
+        "whisper_low_latency": True,  # greedy decoding (beam 1 / best-of 1)
+        "whisper_interim": True,  # live partial captions while still speaking
+        "whisper_max_segment_s": 6.0,  # cut continuous speech into pieces this long
     }
 
     def __init__(self, slug: str):
@@ -525,12 +885,12 @@ class VoiceTranslatorApp:
         self.display_running = True
         self.slug = slug
         self.last_active = time.time()
-        self.popout_id = secrets.token_urlsafe(16)
 
-        self.audio_queue: queue.Queue = (
-            queue.Queue()
-        )  # ~450ms max backlog at 30ms blocks
+        self.audio_queue: queue.Queue = queue.Queue()
         self.result_queue: queue.Queue = queue.Queue()
+        # Translation runs on its own thread so a slow translator never holds
+        # back the recognized text (see _update_display_loop).
+        self._translate_queue: queue.Queue = queue.Queue()
         self.is_running = False
         self.is_monitoring = False  # mic-test mode (level only, no recognition)
 
@@ -545,8 +905,23 @@ class VoiceTranslatorApp:
         self._monitor_stream = None
         self.vad: FastVAD | None = None
         self.monitor_level: float = 0.0  # latest RMS from hardware mic
+        self.whisper_worker: LiveWhisperWorker | None = None
+        self._whisper_translator: WhisperRecognizer | None = None
+        self._last_interim_at = 0.0
+        self._last_backlog_warning = 0.0
 
-        self._transcribe_sem = threading.Semaphore(3)
+        # Audio-source liveness (see check_audio_watchdog)
+        self._started_at = 0.0
+        self._last_audio_at = 0.0
+        # Why the session last stopped + a counter the page polls, so an
+        # automatic stop (source disconnected) is shown in every open tab.
+        self.stop_reason: str | None = None
+        self.state_seq = 0
+
+        # The one browser tab currently streaming audio into this session:
+        # (connection id, WebSocket, event loop). A newer tab replaces it.
+        self._audio_client: tuple | None = None
+        self._audio_client_lock = threading.Lock()
 
         # Serializes start/stop/monitor transitions. Without this, Gradio's
         # concurrency settings (interface.queue(default_concurrency_limit=None))
@@ -572,6 +947,12 @@ class VoiceTranslatorApp:
         # split the old single browser mode into mic vs tab/system audio).
         if self.settings.get("audio_mode") == "browser":
             self.settings["audio_mode"] = "browser_mic"
+        # The popout id lives in settings so it's saved per session and an
+        # OBS browser source keeps working across restarts. Generate (and
+        # save) one the first time a session exists.
+        if not self.settings.get("popout_id"):
+            self.settings["popout_id"] = secrets.token_urlsafe(16)
+            persist_settings(slug, self.settings)
 
         # Subtitle manager — settings applied dynamically
         self.subtitles = SubtitleManager(
@@ -588,6 +969,19 @@ class VoiceTranslatorApp:
             target=self._update_display_loop, daemon=True
         )
         self.display_thread.start()
+        self.translate_thread = threading.Thread(
+            target=self._translate_loop, daemon=True
+        )
+        self.translate_thread.start()
+
+    @property
+    def popout_id(self) -> str:
+        return self.settings.get("popout_id", "")
+
+    @popout_id.setter
+    def popout_id(self, value: str):
+        self.settings["popout_id"] = value
+        persist_settings(self.slug, self.settings)
 
     # ── Validation helpers ────────────────────────────────────────────────────
     def is_repetitive_garbage(self, text: str) -> bool:
@@ -638,6 +1032,7 @@ class VoiceTranslatorApp:
         if self.vad:
             self.vad.update_threshold(self.settings.get("vad_threshold", -30.0))
             self.vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 300))
+            self.vad.update_max_segment_ms(self._max_segment_ms())
             thresh = self.settings.get("noise_filter_threshold", 0.0)
             self.vad.update_noise_filter_threshold(thresh)
 
@@ -714,6 +1109,7 @@ class VoiceTranslatorApp:
     # ── Audio processing ──────────────────────────────────────────────────────
     def audio_callback(self, indata, frames, time_info, status):
         if self.is_running:
+            self._last_audio_at = time.time()
             data = bytes(indata)
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -732,12 +1128,70 @@ class VoiceTranslatorApp:
 
             self.audio_queue.put(data)  # <-- unbounded queue, never blocks
 
+    # ── Browser audio (WebSocket) ─────────────────────────────────────────────
+    def attach_audio_client(self, websocket, loop) -> tuple[int, tuple | None]:
+        """
+        Make `websocket` this session's browser audio source. Returns
+        (connection id, previous client or None). Only one tab streams into a
+        session at a time — two tabs feeding the same recognizer would
+        interleave their audio — so the newest one wins and the caller tells
+        the previous one it was replaced.
+        """
+        conn_id = id(websocket)
+        with self._audio_client_lock:
+            previous = self._audio_client
+            self._audio_client = (conn_id, websocket, loop)
+        return conn_id, previous
+
+    def detach_audio_client(self, conn_id: int):
+        with self._audio_client_lock:
+            if self._audio_client and self._audio_client[0] == conn_id:
+                self._audio_client = None
+
+    @property
+    def has_audio_client(self) -> bool:
+        return self._audio_client is not None
+
+    def feed_browser_audio(self, data: bytes, conn_id: int):
+        # Audio arriving while stopped (or from a tab that has been replaced)
+        # is dropped. It used to be queued regardless, so a stopped session
+        # could build up minutes of stale audio that the next Start then
+        # processed first.
+        client = self._audio_client
+        if not self.is_running or client is None or client[0] != conn_id:
+            return
+        if not str(self.settings.get("audio_mode", "")).startswith("browser"):
+            return
+        self._last_audio_at = time.time()
+        self.audio_queue.put(data)
+        self.touch()
+
+    def _notify_audio_client(self, payload: dict):
+        """Send a JSON control message to the streaming tab, from any thread."""
+        client = self._audio_client
+        if not client:
+            return
+        _, ws, loop = client
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), loop)
+        except Exception:
+            pass
+
+    def _max_segment_ms(self) -> int:
+        if self.settings.get("recognition_engine") != "whisper":
+            return 0
+        try:
+            return int(float(self.settings.get("whisper_max_segment_s", 6.0)) * 1000)
+        except (TypeError, ValueError):
+            return 6000
+
     def _get_or_create_vad(self) -> FastVAD:
         if self.vad is None:
             self.vad = FastVAD(
                 threshold_db=self.settings.get("vad_threshold", -30.0),
                 end_silence_ms=self.settings.get("vad_end_silence_ms", 300),
                 noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
+                max_segment_ms=self._max_segment_ms(),
             )
         return self.vad
 
@@ -785,56 +1239,93 @@ class VoiceTranslatorApp:
                 self.moonshine_recognizer.add_audio(clean)
             return
 
-        # Whisper: VAD segments + cleans in one pass
+        # Whisper: VAD segments + cleans in one pass. Finished segments go to
+        # the ordered live worker (see live_whisper.py).
+        worker = self.whisper_worker
+        if worker is None:
+            return
         for speech_bytes in vad.process_chunk(data):
-            self._transcribe_segment(engine, speech_bytes)
+            self.last_audio_chunk = speech_bytes
+            worker.submit_final(speech_bytes)
+            self._last_interim_at = time.monotonic()
+
+        # Live partial captions for the utterance still in progress — only
+        # while the worker is otherwise idle, so they never delay a final.
+        if (
+            self.settings.get("whisper_interim", True)
+            and vad.in_speech
+            and vad.current_segment_ms() >= _INTERIM_MIN_AUDIO_MS
+            and time.monotonic() - self._last_interim_at >= _INTERIM_INTERVAL_S
+            and worker.idle
+        ):
+            if worker.submit_interim(vad.current_segment()):
+                self._last_interim_at = time.monotonic()
 
     def _apply_noise_filter(self, data: bytes) -> bytes:
         """Legacy shim — delegates to VAD's integrated preprocessor."""
         return self._get_or_create_vad().preprocess_block(data)
 
-    def _transcribe_segment(self, engine: str, speech_bytes: bytes):
-        """Non-blocking dispatch to a worker thread."""
-        self.last_audio_chunk = speech_bytes
-        if not self._transcribe_sem.acquire(blocking=False):
+    def _clean_whisper_text(self, transcription: str) -> str:
+        """Apply the hallucination/garbage filters; '' if the text should be dropped."""
+        transcription = (transcription or "").strip()
+        if not transcription or dots_or_stars(transcription):
+            return ""
+        if is_whisper_hallucination(transcription):
+            self.logger.log(f"Blocked hallucination: {repr(transcription)}", level="debug")
+            return ""
+        if not self.is_valid_transcription(transcription):
+            self.logger.log("Discarded invalid transcription", level="debug")
+            return ""
+        return transcription
+
+    def _whisper_transcribe(self, rec: WhisperRecognizer, audio: bytes, interim: bool) -> str:
+        """LiveWhisperWorker's transcribe_fn."""
+        return rec.transcribe(
+            audio,
+            language=self.settings.get("whisper_language"),
+            # A late interim is useless — give up quickly and let the next one run.
+            timeout=10 if interim else 30,
+        )
+
+    def _whisper_final(self, text: str, audio: bytes):
+        text = self._clean_whisper_text(text)
+        if text:
+            self.result_queue.put(("final", text, audio))
+
+    def _whisper_interim(self, text: str):
+        text = self._clean_whisper_text(text)
+        if text and self.is_running:
+            self.result_queue.put(("interim", text))
+
+    def _drop_audio_backlog(self):
+        """
+        Keep recognition live if processing falls behind the incoming audio
+        (e.g. a slow CPU running Vosk): rather than working through an
+        ever-growing queue of old audio, drop the oldest blocks.
+        """
+        backlog = self.audio_queue.qsize()
+        if backlog <= _AUDIO_BACKLOG_MAX_BLOCKS:
+            return
+        dropped = 0
+        while self.audio_queue.qsize() > _AUDIO_BACKLOG_KEEP_BLOCKS:
+            try:
+                self.audio_queue.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        now = time.monotonic()
+        if now - self._last_backlog_warning > 10:
+            self._last_backlog_warning = now
             self.logger.log(
-                "Transcription backlog – dropping segment (recogniser is busy)",
+                f"Audio processing fell behind — skipped {dropped} old audio "
+                f"blocks to stay live",
                 level="warning",
             )
-            return
-        t = threading.Thread(
-            target=self._do_transcribe, args=(engine, speech_bytes), daemon=True
-        )
-        t.start()
-
-    def _do_transcribe(self, engine: str, speech_bytes: bytes):
-        """Worker: transcribe one Whisper segment and enqueue the result."""
-        try:
-            transcription = ""
-            if engine == "whisper":
-                rec = self.whisper_recognizer
-                if rec is None:
-                    return
-                transcription = rec.transcribe(
-                    speech_bytes, language=self.settings.get("whisper_language")
-                )
-            if transcription and not dots_or_stars(transcription):
-                if is_whisper_hallucination(transcription):
-                    self.logger.log(
-                        f"Blocked hallucination: {repr(transcription)}", level="debug"
-                    )
-                elif self.is_valid_transcription(transcription):
-                    self.result_queue.put(("final", transcription))
-                else:
-                    self.logger.log("Discarded invalid transcription", level="debug")
-        except Exception as exc:
-            self.logger.log(f"Transcription error: {exc}", level="error")
-        finally:
-            self._transcribe_sem.release()
 
     def process_audio_hardware(self):
         while self.is_running:
             try:
+                self._drop_audio_backlog()
                 # Timeout matches blocksize (30ms) so we never wait longer than one block
                 data = self.audio_queue.get(timeout=0.03)
                 engine = self.settings["recognition_engine"]
@@ -856,6 +1347,10 @@ class VoiceTranslatorApp:
             return "⏳ Already starting or stopping — please wait a moment"
         try:
             if self.is_running:
+                if str(self.settings.get("audio_mode", "")).startswith("browser"):
+                    # The page (re)attaches its browser audio on every Start
+                    # click, so this is how you resume after a page reload.
+                    return "✅ Already running — browser audio re-attached"
                 return "⚠️ Already running — press Stop first"
 
             # Defensive: release any vosk model reference from a previous run
@@ -884,14 +1379,19 @@ class VoiceTranslatorApp:
                 self.moonshine_recognizer = None
 
             elif engine == "whisper":
+                # Low-latency mode: greedy decoding. Beam search (beam 5 /
+                # best-of 5) is several times slower per request on most
+                # servers for a small accuracy gain — the wrong trade for
+                # live captions.
+                low_latency = bool(self.settings.get("whisper_low_latency", True))
                 self.whisper_recognizer = WhisperRecognizer(
                     host=self.settings["whisper_host"],
                     api_key=self.settings.get("whisper_api_key") or None,
                     model=self.settings["whisper_model"],
                     logger=self.logger,
                     temperature=self.settings["whisper_temperature"],
-                    best_of=self.settings["whisper_best_of"],
-                    beam_size=self.settings["whisper_beam_size"],
+                    best_of=1 if low_latency else self.settings["whisper_best_of"],
+                    beam_size=1 if low_latency else self.settings["whisper_beam_size"],
                     patience=self.settings["whisper_patience"],
                     length_penalty=self.settings["whisper_length_penalty"],
                     suppress_tokens=self.settings["whisper_suppress_tokens"],
@@ -910,9 +1410,26 @@ class VoiceTranslatorApp:
                     endpoint_url=self.settings.get("whisper_endpoint_url"),
                     response_text_path=self.settings.get("whisper_response_text_path"),
                 )
+                rec = self.whisper_recognizer
+                self.whisper_worker = LiveWhisperWorker(
+                    transcribe_fn=lambda audio, interim: self._whisper_transcribe(
+                        rec, audio, interim
+                    ),
+                    on_final=self._whisper_final,
+                    on_interim=self._whisper_interim,
+                    logger=self.logger,
+                )
+                self._last_interim_at = 0.0
                 self.recognizer = None
                 self.model = None
                 self.moonshine_recognizer = None
+                self.logger.log(
+                    "Whisper live mode: "
+                    + ("greedy decoding" if low_latency else "beam search")
+                    + (", interim captions on" if self.settings.get("whisper_interim", True) else "")
+                    + f", max segment {self._max_segment_ms() / 1000:.0f}s",
+                    level="info",
+                )
 
             elif engine == "moonshine":
                 if not _MOONSHINE_AVAILABLE:
@@ -934,23 +1451,25 @@ class VoiceTranslatorApp:
             # Reset/recreate VAD with current settings
             if self.vad:
                 self.vad.flush()
-            self.vad = FastVAD(
-                threshold_db=self.settings.get("vad_threshold", -30.0),
-                end_silence_ms=self.settings.get("vad_end_silence_ms", 300),
-                noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
-            )
+            self.vad = None
+            self._get_or_create_vad()
 
             # Reset subtitle buffer for new session
             self.subtitles.clear()
 
-            # Moonshine (ONNX) is not thread-safe — serialize transcription.
-            # Whisper is network-bound — allow up to 3 parallel calls.
-            if engine == "moonshine":
-                self._transcribe_sem = threading.Semaphore(1)
-            else:
-                self._transcribe_sem = threading.Semaphore(3)
+            # Start from live audio only — never from anything queued before.
+            self._drain(self.audio_queue)
 
+            self.stop_reason = None
+            self._started_at = time.time()
+            # Hardware: the watchdog expects callbacks from now on. Browser:
+            # 0 = "no audio yet", which gets a longer grace period for the
+            # permission prompt / screen-share picker.
+            self._last_audio_at = (
+                self._started_at if self.settings["audio_mode"] == "hardware" else 0.0
+            )
             self.is_running = True
+            self.state_seq += 1
 
             if (
                 self.settings["audio_mode"] == "hardware"
@@ -990,14 +1509,79 @@ class VoiceTranslatorApp:
         except Exception as exc:
             msg = f"❌ Error starting recognition: {exc}"
             self.logger.log(msg, level="error")
+            # Don't leave a half-started session "running" with no audio
+            # source (e.g. the selected device no longer exists). The control
+            # lock is an RLock, so this nested acquire is fine.
+            if self.is_running:
+                self.stop_recognition(reason=msg)
             return msg
         finally:
             self._control_lock.release()
 
-    def stop_recognition(self) -> str:
+    @staticmethod
+    def _drain(q: queue.Queue):
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+    def check_audio_watchdog(self):
+        """
+        Stop the session if its audio source has gone away. Called about once
+        a second by the global watchdog thread.
+
+        A session with no audio source used to keep "running" forever — a
+        server device that was unplugged just stopped invoking the callback,
+        and a browser whose mic was disconnected (or whose tab was closed)
+        just stopped sending. Now:
+        - Server device: PortAudio calls back every 30 ms even in total
+          silence, so no callbacks for a few seconds (or the stream going
+          inactive) means the device is gone.
+        - Browser: the page streams continuously, silence included, and
+          reconnects on its own after a network blip — so no audio for
+          `audio_watchdog_seconds` means the source really is gone.
+        """
+        if not self.is_running:
+            return
+        try:
+            timeout = float(self.settings.get("audio_watchdog_seconds", 8) or 0)
+        except (TypeError, ValueError):
+            timeout = 8.0
+        if timeout <= 0:
+            return
+        now = time.time()
+        reason = None
+        if self.settings.get("audio_mode") == "hardware":
+            stream = self.stream
+            if stream is not None and not stream.active:
+                reason = "🔌 Audio device stopped (disconnected?) — session stopped"
+            elif now - self._last_audio_at > min(timeout, _HW_WATCHDOG_MAX_S):
+                reason = "🔌 No audio from the input device (disconnected?) — session stopped"
+        else:
+            if self._last_audio_at:
+                silent_for = now - self._last_audio_at
+                limit = timeout
+            else:
+                # Nothing received yet: allow for the mic permission prompt
+                # or the screen-share picker.
+                silent_for = now - self._started_at
+                limit = max(timeout, _BROWSER_START_GRACE_S)
+            if silent_for > limit:
+                reason = (
+                    f"🔌 No browser audio for {int(silent_for)}s (mic disconnected, "
+                    f"sharing stopped, or tab closed) — session stopped"
+                )
+        if reason:
+            self.stop_recognition(reason=reason)  # logs the reason
+
+    def stop_recognition(self, reason: str | None = None) -> str:
         """
         Stop audio capture and unload all recognition models to free memory.
         Settings are fully preserved – pressing Start again will reload models.
+
+        `reason` is shown in every open tab of this session; None means a
+        normal user Stop.
         """
         # Blocking with a generous timeout: if Start is mid-way through loading
         # a big model, Stop should wait for that to finish and then unload it
@@ -1008,11 +1592,21 @@ class VoiceTranslatorApp:
             if not self.is_running and self.stream is None and self.recognizer is None:
                 return "Already stopped"
             self.is_running = False
+            self.stop_reason = reason
+            self.state_seq += 1
+            self._notify_audio_client(
+                {"type": "stopped", "reason": reason or "⏹️ Recognition stopped"}
+            )
 
-            # Stop hardware stream
+            # Stop hardware stream. abort() rather than stop(): stop() waits
+            # for buffers to drain, which can hang on a device that has just
+            # been unplugged.
             if self.stream:
                 try:
-                    self.stream.stop()
+                    self.stream.abort()
+                except Exception:
+                    pass
+                try:
                     self.stream.close()
                 except Exception:
                     pass
@@ -1021,20 +1615,27 @@ class VoiceTranslatorApp:
             # Give the processing thread a moment to see is_running=False and
             # exit its loop before we start deleting the objects it's using.
             pt = getattr(self, "process_thread", None)
-            if pt and pt.is_alive():
+            if pt and pt.is_alive() and pt is not threading.current_thread():
                 pt.join(timeout=1.0)
 
             # Clear audio buffers
             self.vosk_audio_buffer.clear()
+            self._drain(self.audio_queue)
 
             # Flush any speech the VAD was accumulating mid-utterance (Whisper only)
             if self.vad:
                 leftover = self.vad.flush()
-                engine = self.settings.get("recognition_engine", "vosk")
-                if leftover and engine == "whisper":
-                    # Dispatch synchronously before tearing down the recognizer
-                    self._do_transcribe(engine, leftover)
+                if leftover and self.whisper_worker:
+                    self.whisper_worker.submit_final(leftover)
                 self.vad = None
+
+            # Let the worker finish the last utterance (in the background, so
+            # Stop returns immediately), then release it.
+            if self.whisper_worker:
+                threading.Thread(
+                    target=self.whisper_worker.close, daemon=True
+                ).start()
+                self.whisper_worker = None
 
             # Unload Vosk model to free memory
             self._unload_vosk()
@@ -1048,11 +1649,12 @@ class VoiceTranslatorApp:
                 self.moonshine_recognizer = None
 
             self.translation_service = None
+            self._whisper_translator = None
 
             gc.collect()
 
-            msg = "⏹️ Recognition stopped (models unloaded)"
-            self.logger.log(msg, level="success")
+            msg = reason or "⏹️ Recognition stopped (models unloaded)"
+            self.logger.log(msg, level="warning" if reason else "success")
             return msg
         finally:
             self._control_lock.release()
@@ -1081,15 +1683,27 @@ class VoiceTranslatorApp:
     def _update_display_loop(self):
         while self.display_running:
             try:
-                result_type, text = self.result_queue.get(timeout=0.02)  # 20ms max wait
+                item = self.result_queue.get(timeout=0.02)  # 20ms max wait
+                result_type, text = item[0], item[1]
                 if result_type == "stop":
                     break
                 if result_type == "final":
-                    translated = ""
-                    if self.settings["enable_translation"]:
-                        translated = self._translate(text)
-                    self.subtitles.add(text, translated)
-                elif result_type == "interim" and self.settings.get("display_interim"):
+                    audio = item[2] if len(item) > 2 else self.last_audio_chunk
+                    if not self.settings["enable_translation"]:
+                        self.subtitles.add(text, "")
+                    elif self.subtitles.mode == "instant":
+                        # Show the recognized text now; the translation is
+                        # filled in when it's ready (_translate_loop).
+                        self.subtitles.add(text, "")
+                        self._translate_queue.put((text, audio, "instant"))
+                    else:
+                        # Buffered mode pairs recognized+translated as one
+                        # chunk, so it has to wait for the translation.
+                        self._translate_queue.put((text, audio, "buffered"))
+                elif result_type == "interim" and (
+                    self.settings.get("display_interim")
+                    or self.settings.get("recognition_engine") == "whisper"
+                ):
                     self.subtitles.set_interim(text)
             except queue.Empty:
                 if not self.display_running:
@@ -1101,45 +1715,87 @@ class VoiceTranslatorApp:
                 if self.display_running:
                     self.logger.log(f"Display loop error: {exc}", level="error")
 
-    def _translate(self, text: str) -> str:
+    def _translate_loop(self):
+        """Translate finals off the display thread, in order."""
+        while self.display_running:
+            try:
+                item = self._translate_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            text, audio, mode = item
+            if mode == "instant":
+                # Only the newest line is on screen in instant mode — if the
+                # translator fell behind, skip straight to the latest line
+                # instead of translating text nobody will see.
+                while True:
+                    try:
+                        newer = self._translate_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if newer is None:
+                        return
+                    if newer[2] != "instant":
+                        self._translate_queue.put(newer)
+                        break
+                    text, audio, mode = newer
+            try:
+                translated = self._translate(text, audio)
+            except Exception as exc:
+                self.logger.log(f"Translation error: {exc}", level="error")
+                translated = ""
+            if mode == "instant":
+                self.subtitles.set_translation(text, translated)
+            else:
+                self.subtitles.add(text, translated)
+
+    def _get_whisper_translator(self) -> WhisperRecognizer:
+        # Reused between lines so its HTTP connection stays open (a new
+        # client per line meant a new TCP/TLS handshake every time).
+        if self._whisper_translator is None:
+            self._whisper_translator = WhisperRecognizer(
+                host=self.settings.get("whisper_translate_host"),
+                api_key=self.settings.get("whisper_translate_api_key") or None,
+                model=self.settings.get("whisper_translate_model"),
+                logger=self.logger,
+                temperature=self.settings["whisper_translate_temperature"],
+                best_of=self.settings["whisper_translate_best_of"],
+                beam_size=self.settings["whisper_translate_beam_size"],
+                patience=self.settings["whisper_translate_patience"],
+                length_penalty=self.settings["whisper_translate_length_penalty"],
+                suppress_tokens=self.settings["whisper_translate_suppress_tokens"],
+                initial_prompt=self.settings["whisper_translate_initial_prompt"]
+                or None,
+                condition_on_previous_text=self.settings[
+                    "whisper_translate_condition_on_previous_text"
+                ],
+                temperature_increment_on_fallback=self.settings[
+                    "whisper_translate_temperature_increment_on_fallback"
+                ],
+                no_speech_threshold=self.settings[
+                    "whisper_translate_no_speech_threshold"
+                ],
+                logprob_threshold=self.settings[
+                    "whisper_translate_logprob_threshold"
+                ],
+                compression_ratio_threshold=self.settings[
+                    "whisper_translate_compression_ratio_threshold"
+                ],
+                endpoint_url=self.settings.get("whisper_translate_endpoint_url"),
+                response_text_path=self.settings.get(
+                    "whisper_translate_response_text_path"
+                ),
+            )
+        return self._whisper_translator
+
+    def _translate(self, text: str, audio: bytes | None = None) -> str:
         """Translate text using the configured translation mode."""
         mode = self.settings.get("translation_mode")
+        audio = audio or self.last_audio_chunk
         try:
-            if mode == "whisper" and self.last_audio_chunk:
-                wt = WhisperRecognizer(
-                    host=self.settings.get("whisper_translate_host"),
-                    api_key=self.settings.get("whisper_translate_api_key") or None,
-                    model=self.settings.get("whisper_translate_model"),
-                    logger=self.logger,
-                    temperature=self.settings["whisper_translate_temperature"],
-                    best_of=self.settings["whisper_translate_best_of"],
-                    beam_size=self.settings["whisper_translate_beam_size"],
-                    patience=self.settings["whisper_translate_patience"],
-                    length_penalty=self.settings["whisper_translate_length_penalty"],
-                    suppress_tokens=self.settings["whisper_translate_suppress_tokens"],
-                    initial_prompt=self.settings["whisper_translate_initial_prompt"]
-                    or None,
-                    condition_on_previous_text=self.settings[
-                        "whisper_translate_condition_on_previous_text"
-                    ],
-                    temperature_increment_on_fallback=self.settings[
-                        "whisper_translate_temperature_increment_on_fallback"
-                    ],
-                    no_speech_threshold=self.settings[
-                        "whisper_translate_no_speech_threshold"
-                    ],
-                    logprob_threshold=self.settings[
-                        "whisper_translate_logprob_threshold"
-                    ],
-                    compression_ratio_threshold=self.settings[
-                        "whisper_translate_compression_ratio_threshold"
-                    ],
-                    endpoint_url=self.settings.get("whisper_translate_endpoint_url"),
-                    response_text_path=self.settings.get(
-                        "whisper_translate_response_text_path"
-                    ),
-                )
-                return wt.translate(self.last_audio_chunk)
+            if mode == "whisper" and audio:
+                return self._get_whisper_translator().translate(audio)
             elif mode == "argos" and self.argos_translator:
                 return self.argos_translator.translate(
                     text,
@@ -1359,7 +2015,7 @@ class VoiceTranslatorApp:
             f"if(n!==e.textContent){{e.textContent=n;reset()}}"
             f'document.getElementById("t").textContent=d.translated||""'
             f"}}catch(e){{}}}}"
-            f"setInterval(update,500);"
+            f"setInterval(update,150);"
             f'document.addEventListener("DOMContentLoaded",()=>{{update();reset()}});</script>'
             f"</head><body>"
             f'<div id="c" class="container">'
@@ -1377,6 +2033,7 @@ class VoiceTranslatorApp:
             self.stop_mic_monitor()
 
         self.display_running = False
+        self._translate_queue.put(None)
         if self.display_thread and self.display_thread.is_alive():
             try:
                 self.result_queue.put(("stop", ""))
@@ -1386,11 +2043,7 @@ class VoiceTranslatorApp:
 
         # Drain queues
         for q in (self.result_queue, self.audio_queue):
-            while True:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
+            self._drain(q)
 
         self.argos_translator = None
         gc.collect()
@@ -1501,6 +2154,13 @@ def _release_vosk_model(model_path: str | None):
             )
 
 
+def _source_ended_reason(detail: str) -> str:
+    detail = re.sub(r"[^\w .,:'()-]", "", str(detail or ""))[:80]
+    return "🔌 Browser audio source ended" + (
+        f" ({detail})" if detail else ""
+    ) + " — session stopped"
+
+
 def get_or_create_app(slug: str) -> VoiceTranslatorApp:
     with SESSION_LOCK:
         if slug not in SESSION_APPS:
@@ -1554,6 +2214,54 @@ def _idle_reaper_loop():
 
 
 threading.Thread(target=_idle_reaper_loop, daemon=True).start()
+
+
+# ── Audio watchdog ────────────────────────────────────────────────────────────
+# Stops any running session whose audio source has disappeared (unplugged
+# device, disconnected browser mic, closed tab). Per-session opt-out via the
+# "Auto-stop when audio is lost" setting (0 = never). See
+# VoiceTranslatorApp.check_audio_watchdog.
+def _audio_watchdog_loop():
+    while True:
+        time.sleep(1.0)
+        with SESSION_LOCK:
+            apps = list(SESSION_APPS.values())
+        for app in apps:
+            try:
+                app.check_audio_watchdog()
+            except Exception as exc:
+                print(f"[WATCHDOG] {app.slug}: {exc}")
+
+
+threading.Thread(target=_audio_watchdog_loop, daemon=True).start()
+
+
+def find_app_by_popout_id(popout_id: str) -> "VoiceTranslatorApp | None":
+    """
+    The session that owns `popout_id`: a loaded one, or — straight after a
+    server restart, before anyone reopened its UI — a saved one, which gets
+    loaded. That's what lets an OBS browser source pointed at /popout/<id>
+    keep working across restarts.
+    """
+    with SESSION_LOCK:
+        for app in SESSION_APPS.values():
+            if app.popout_id == popout_id:
+                return app
+    slug = find_slug_by_popout_id(popout_id)
+    if slug:
+        app = get_or_create_app(slug)
+        if app.popout_id == popout_id:
+            return app
+    return None
+
+
+def popout_id_in_use(popout_id: str, except_slug: str) -> bool:
+    with SESSION_LOCK:
+        for slug, app in SESSION_APPS.items():
+            if slug != except_slug and app.popout_id == popout_id:
+                return True
+    owner = find_slug_by_popout_id(popout_id)
+    return owner is not None and owner != except_slug
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -1660,6 +2368,35 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             label="Model", value="whisper-large-v3"
                         )
                         whisper_language = gr.Textbox(label="Language", value="en")
+                        with gr.Group():
+                            gr.Markdown(
+                                "**Live mode** · for conversation: captions appear "
+                                "while you speak instead of after you stop"
+                            )
+                            whisper_low_latency = gr.Checkbox(
+                                value=True,
+                                label="Low-latency decoding",
+                                info="Greedy decoding (beam size 1, best-of 1) — overrides "
+                                "the Beam size / Best of sliders below. Several times faster "
+                                "per request on most servers for a small accuracy cost.",
+                            )
+                            whisper_interim = gr.Checkbox(
+                                value=True,
+                                label="Live partial captions",
+                                info="Show a best guess of the sentence in progress, "
+                                "refreshed about every 0.8 s while the server is idle. "
+                                "Never delays the final text.",
+                            )
+                            whisper_max_segment_s = gr.Slider(
+                                2,
+                                30,
+                                6,
+                                step=1,
+                                label="Max segment length (s)",
+                                info="Continuous speech is sent in pieces of at most this "
+                                "long (cut at the quietest point), instead of waiting for "
+                                "you to pause. Lower = more live; higher = more context.",
+                            )
                         with gr.Accordion("Advanced Whisper Parameters", open=False):
                             whisper_temperature = gr.Slider(
                                 0.0, 1.0, 0.0, step=0.1, label="Temperature"
@@ -1862,6 +2599,18 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             "'thank you'. Raise further (500–800ms) if it's still cutting "
                             "off mid-sentence; lower it if replies feel laggy.",
                         )
+                    audio_watchdog_seconds = gr.Slider(
+                        minimum=0,
+                        maximum=60,
+                        value=8,
+                        step=1,
+                        label="Auto-stop when audio is lost (s)",
+                        info="Stop the session automatically when its audio source "
+                        "disappears: the server device is unplugged, or no audio has "
+                        "arrived from the browser (mic disconnected, sharing stopped, "
+                        "tab closed) for this many seconds. Brief network drops "
+                        "reconnect on their own. 0 = never auto-stop.",
+                    )
                     # After vad_end_silence_ms slider, add:
                     with gr.Group():
                         gr.Markdown(
@@ -2115,12 +2864,16 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                     start_btn = gr.Button("▶️ Start", variant="primary")
                     stop_btn = gr.Button("⏹️ Stop")
 
-                status_text = gr.Textbox(label="Status", lines=2)
+                status_text = gr.Textbox(label="Status", lines=2, elem_id="status-text")
 
                 gr.Markdown("### 📺 Display")
                 popout_url = gr.Textbox(label="Popout URL", interactive=False)
                 with gr.Group():
-                    gr.Markdown("For a custom ID enter the string and press Enter")
+                    gr.Markdown(
+                        "For a custom ID type it and press Enter (or click away). "
+                        "The ID is saved with this session, so the OBS URL keeps "
+                        "working after restarts."
+                    )
                     custom_popout_id = gr.Textbox(
                         label="Custom Popout ID",
                         placeholder="Enter custom ID or leave empty for random",
@@ -2128,7 +2881,11 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                     )
                     random_btn = gr.Button("🎲 Random", scale=1, size="sm")
 
-                display_html = gr.HTML(label="Display", value="<div>Loading...</div>")
+                # Filled in by the page's JS polling (/display_data), not by Gradio.
+                display_html = gr.HTML(
+                    label="Display",
+                    value='<div id="vt-display"><div>Loading...</div></div>',
+                )
 
                 with gr.Accordion("Outputs", open=False):
                     recognized_output = gr.Textbox(
@@ -2239,7 +2996,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         "🔄 Reset to Defaults", variant="secondary", size="sm"
                     )
 
-        log_output = gr.Textbox(label="Log", lines=6)
+        log_output = gr.Textbox(label="Log", lines=6, elem_id="log_output")
 
         # ── Event handlers ────────────────────────────────────────────────────
 
@@ -2382,25 +3139,47 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 app.settings["custom_font"] = ""
             persist_settings(app.slug, app.settings)
 
+        def _popout_url(request: gr.Request, app: VoiceTranslatorApp) -> str:
+            # Build the URL the browser actually used (host + scheme, incl.
+            # behind a reverse proxy) instead of the bind address, which is
+            # usually 0.0.0.0 and not something OBS can open.
+            base = f"http://{args.host}:{args.port}"
+            try:
+                headers = request.headers
+                host = headers.get("x-forwarded-host") or headers.get("host")
+                if host:
+                    proto = headers.get("x-forwarded-proto") or "http"
+                    base = f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+            except Exception:
+                pass
+            return f"{base}/popout/{app.popout_id}"
+
         def update_custom_popout_id(value, request: gr.Request):
+            # The id is saved with the session's settings (see
+            # VoiceTranslatorApp.popout_id), so the OBS URL survives restarts.
             app = get_or_create_app(get_slug(request))
-            if value and value.strip():
-                sanitized = re.sub(r"[^a-zA-Z0-9_-]", "", value.strip())
-                app.popout_id = sanitized if sanitized else secrets.token_urlsafe(16)
-            else:
+            sanitized = re.sub(r"[^a-zA-Z0-9_-]", "", (value or "").strip())[:64]
+            if not sanitized:
                 app.popout_id = secrets.token_urlsafe(16)
-            return (
-                f"http://{args.host}:{args.port}/popout/{app.popout_id}",
-                app.popout_id,
-            )
+                status = f"🎲 New random popout ID saved: {app.popout_id}"
+            elif sanitized == app.popout_id:
+                status = f"✅ Popout ID unchanged: {sanitized}"
+            elif popout_id_in_use(sanitized, app.slug):
+                status = (
+                    f"❌ Popout ID '{sanitized}' is already used by another "
+                    f"session — kept '{app.popout_id}'"
+                )
+            else:
+                app.popout_id = sanitized
+                status = f"✅ Popout ID saved: {sanitized}"
+            app.logger.log(status, level="info")
+            return _popout_url(request, app), app.popout_id, status
 
         def generate_random_popout(value, request: gr.Request):
             app = get_or_create_app(get_slug(request))
             app.popout_id = secrets.token_urlsafe(16)
-            return (
-                f"http://{args.host}:{args.port}/popout/{app.popout_id}",
-                app.popout_id,
-            )
+            status = f"🎲 New random popout ID saved: {app.popout_id}"
+            return _popout_url(request, app), app.popout_id, status
 
         def test_whisper_connection(request: gr.Request):
             app = get_or_create_app(get_slug(request))
@@ -2486,12 +3265,6 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         def stop_rec(request: gr.Request):
             return get_or_create_app(get_slug(request)).stop_recognition()
 
-        def update_display(request: gr.Request):
-            return get_or_create_app(get_slug(request)).get_current_display()
-
-        def update_logs(request: gr.Request):
-            return get_or_create_app(get_slug(request)).update_logs()
-
         def cleanup_user_data(request: gr.Request):
             # Tabs closing / reloading no longer destroys the session — a
             # session now lives until the user explicitly closes it (via the
@@ -2500,12 +3273,16 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             # This is what makes a reload/reconnect re-attach cleanly instead
             # of losing state — which is also what fixed the "sometimes it
             # just refreshes" symptom: it used to tear the whole session down.
+            #
+            # Gradio fires this on *any* heartbeat drop, not only a real tab
+            # close — the tab usually reconnects with the same session_hash
+            # a moment later. So the session_hash -> slug mapping is kept
+            # (session.py bounds its size); forgetting it here used to leave
+            # the tab controlling a ghost session after a network blip.
             slug = get_slug(request)
             app = SESSION_APPS.get(slug)
             if app:
                 app.touch()
-            # Bound the session_hash -> slug registry to currently-open tabs.
-            forget_session_hash(request.session_hash)
 
         def handle_ui_load(js_slug, request: gr.Request):
             # js_slug came from window.location/sessionStorage in the browser
@@ -2536,7 +3313,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
 
             return {
                 session_info: f"### 🎯 Session: `{slug}` | Active: {len(SESSION_APPS)}",
-                popout_url: f"http://{args.host}:{args.port}/popout/{app.popout_id}",
+                popout_url: _popout_url(request, app),
                 vosk_model_dropdown: s["vosk_model"],
                 mic_dropdown: s.get("microphone"),
                 recognition_engine: s["recognition_engine"],
@@ -2635,6 +3412,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 custom_popout_id: app.popout_id,
                 session_dropdown: gr.update(choices=[]),
                 noise_filter_threshold: s["noise_filter_threshold"],
+                audio_watchdog_seconds: s["audio_watchdog_seconds"],
+                whisper_low_latency: s["whisper_low_latency"],
+                whisper_interim: s["whisper_interim"],
+                whisper_max_segment_s: s["whisper_max_segment_s"],
             }
 
         def reset_to_defaults(request: gr.Request):
@@ -2743,6 +3524,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 moonshine_language: s["moonshine_language"],
                 moonshine_cache_dir: s["moonshine_cache_dir"],
                 noise_filter_threshold: s["noise_filter_threshold"],
+                audio_watchdog_seconds: s["audio_watchdog_seconds"],
+                whisper_low_latency: s["whisper_low_latency"],
+                whisper_interim: s["whisper_interim"],
+                whisper_max_segment_s: s["whisper_max_segment_s"],
             }
 
         # ── Wire events ───────────────────────────────────────────────────────
@@ -2957,6 +3742,14 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         noise_filter_threshold.change(
             _set_vad("noise_filter_threshold"), [noise_filter_threshold]
         )
+        audio_watchdog_seconds.change(
+            _set("audio_watchdog_seconds"), [audio_watchdog_seconds]
+        )
+        whisper_low_latency.change(_set("whisper_low_latency"), [whisper_low_latency])
+        whisper_interim.change(_set("whisper_interim"), [whisper_interim])
+        whisper_max_segment_s.change(
+            _set_vad("whisper_max_segment_s"), [whisper_max_segment_s]
+        )
 
         # Mic test
         test_mic_btn.click(
@@ -2996,10 +3789,21 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
 
         # Popout
         custom_popout_id.submit(
-            update_custom_popout_id, [custom_popout_id], [popout_url, custom_popout_id]
+            update_custom_popout_id,
+            [custom_popout_id],
+            [popout_url, custom_popout_id, status_text],
+        )
+        # Also save when the field loses focus — pressing Enter used to be the
+        # only way, and the id was never written to disk either way.
+        custom_popout_id.blur(
+            update_custom_popout_id,
+            [custom_popout_id],
+            [popout_url, custom_popout_id, status_text],
         )
         random_btn.click(
-            generate_random_popout, [random_btn], [popout_url, custom_popout_id]
+            generate_random_popout,
+            [random_btn],
+            [popout_url, custom_popout_id, status_text],
         )
 
         # Session management
@@ -3057,18 +3861,20 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         test_whisper_btn.click(test_whisper_connection, outputs=[status_text])
 
         # Start — also starts HW level polling; stops mic test if active
+        # (The browser stream status box is driven by the page's JS, which
+        # knows whether the mic actually opened / the socket is connected.)
         start_btn.click(
             fn=start_rec, outputs=[status_text], js="startBrowserStreaming"
-        ).then(fn=lambda: "Streaming started", outputs=[browser_status]).then(
+        ).then(
+            fn=None, inputs=[status_text], js="(s) => { window.vtAfterStart(s); }"
+        ).then(
             fn=lambda: gr.update(visible=False), outputs=[stop_test_mic_btn]
         ).then(fn=None, js="startHwLevelPolling")
 
         # Stop — stop HW polling too
         stop_btn.click(
             fn=stop_rec, outputs=[status_text], js="stopBrowserStreaming"
-        ).then(fn=lambda: "Streaming stopped", outputs=[browser_status]).then(
-            fn=None, js="stopHwLevelPolling"
-        )
+        ).then(fn=None, js="stopHwLevelPolling")
 
         reset_defaults_btn.click(
             reset_to_defaults,
@@ -3149,14 +3955,21 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 moonshine_language,
                 moonshine_cache_dir,
                 noise_filter_threshold,
+                audio_watchdog_seconds,
+                whisper_low_latency,
+                whisper_interim,
+                whisper_max_segment_s,
             ],
         )
 
-        # ── Polling timers (reliable Gradio method) ───────────────────────────
-        gr.Timer(0.05).tick(
-            update_display, outputs=[display_html, recognized_output, translated_output]
-        )
-        gr.Timer(1.0).tick(update_logs, outputs=[log_output])
+        # ── Display / logs / session-state polling ────────────────────────────
+        # Done by the page's own JS (startAllPolling) with plain fetch() calls
+        # to /display_data and /logs_data. This used to be a gr.Timer(0.05):
+        # 20 Gradio queue events per second per open tab, all through the
+        # same connection as every button click. When anything slowed that
+        # connection (a backgrounded tab, a proxy, a busy server) the backlog
+        # made the page stall and reconnect — the "refresh" that cut off
+        # the mic stream.
 
         interface.unload(cleanup_user_data)
 
@@ -3177,6 +3990,14 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             }
             slug = slug.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'main';
             sessionStorage.setItem('vt_slug', slug);
+            // Keep the session name in the address bar. Besides making the
+            // URL bookmarkable, the browser sends it (as the Referer) with
+            // every Gradio request, which lets the server recover this tab's
+            // session if it ever loses track of it (e.g. after a restart).
+            if (params.get('session') !== slug && window.location.pathname === '/') {
+                params.set('session', slug);
+                history.replaceState(null, '', '/?' + params.toString() + window.location.hash);
+            }
             return [slug];
         }
         """
@@ -3272,6 +4093,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 custom_popout_id,
                 session_dropdown,
                 noise_filter_threshold,
+                audio_watchdog_seconds,
+                whisper_low_latency,
+                whisper_interim,
+                whisper_max_segment_s,
             ],
         )
 
@@ -3354,8 +4179,23 @@ if __name__ == "__main__":
             app = SESSION_APPS.get(slug)
         if app:
             html, rec, trans = app.get_current_display()
-            return JSONResponse({"html": html, "recognized": rec, "translated": trans})
-        return JSONResponse({"html": "", "recognized": "", "translated": ""})
+            return JSONResponse(
+                {
+                    "html": html,
+                    "recognized": rec,
+                    "translated": trans,
+                    # Session state, so every open tab notices an automatic
+                    # stop (audio source lost) and can re-attach after a reload.
+                    "running": app.is_running,
+                    "audio_mode": app.settings.get("audio_mode"),
+                    "audio_client": app.has_audio_client,
+                    "stop_reason": app.stop_reason,
+                    "state_seq": app.state_seq,
+                }
+            )
+        return JSONResponse(
+            {"html": "", "recognized": "", "translated": "", "running": False}
+        )
 
     @fastapi_app.get("/logs_data/{slug}")
     async def get_logs_data(slug: str):
@@ -3387,48 +4227,83 @@ if __name__ == "__main__":
                 return JSONResponse({"status": "deactivated"})
         return JSONResponse({"status": "not found"}, status_code=404)
 
+    @fastapi_app.post("/session_stop/{slug}")
+    async def session_stop(slug: str, reason: str = ""):
+        """Called by the page when its audio source ends and the WebSocket is down."""
+        with SESSION_LOCK:
+            app = SESSION_APPS.get(slug)
+        if app and app.is_running:
+            await run_in_threadpool(
+                app.stop_recognition, reason=_source_ended_reason(reason)
+            )
+        return JSONResponse({"status": "ok"})
+
     @fastapi_app.websocket("/ws/{slug}")
     async def websocket_endpoint(websocket: WebSocket, slug: str):
         await websocket.accept()
         app = get_or_create_app(slug)
+        conn_id, previous = app.attach_audio_client(
+            websocket, asyncio.get_running_loop()
+        )
+        if previous is not None:
+            # Another tab was streaming into this session — tell it to stop
+            # (and not reconnect), so the two don't fight over the session.
+            try:
+                await previous[1].send_text(json.dumps({"type": "replaced"}))
+                await previous[1].close()
+            except Exception:
+                pass
         try:
             while True:
                 msg = await websocket.receive()
-                if msg["type"] == "websocket.receive" and "bytes" in msg:
-                    app.audio_queue.put(msg["bytes"])
-                    app.touch()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                data = msg.get("bytes")
+                if data:
+                    app.feed_browser_audio(data, conn_id)
+                    continue
+                text = msg.get("text")
+                if text:
+                    try:
+                        event = json.loads(text)
+                    except ValueError:
+                        continue
+                    if event.get("type") == "source_ended" and app.is_running:
+                        # The browser saw its mic/tab-share end (unplugged,
+                        # permission revoked, "Stop sharing" clicked).
+                        await run_in_threadpool(
+                            app.stop_recognition,
+                            reason=_source_ended_reason(event.get("reason", "")),
+                        )
         except WebSocketDisconnect:
-            # A dropped browser-audio stream (tab closed, "stop streaming"
-            # clicked, network blip) no longer tears the session down — it
-            # just stops feeding audio in. The session (models, settings,
-            # any hardware-mic recognition) stays alive until the user
-            # explicitly closes it or the idle reaper reclaims it.
+            # A dropped connection alone doesn't stop the session: the page
+            # reconnects by itself after a network blip. If the source is
+            # really gone, the audio watchdog stops the session once no
+            # audio has arrived for `audio_watchdog_seconds`.
             pass
         except Exception as exc:
             print(f"WebSocket error [{slug}]: {exc}")
+        finally:
+            app.detach_audio_client(conn_id)
 
     @fastapi_app.get("/popout/{popout_id}")
     async def get_popout(popout_id: str):
-        with SESSION_LOCK:
-            for app in SESSION_APPS.values():
-                if app.popout_id == popout_id:
-                    return HTMLResponse(content=app.generate_popout_html())
+        app = await run_in_threadpool(find_app_by_popout_id, popout_id)
+        if app:
+            return HTMLResponse(content=app.generate_popout_html())
         return HTMLResponse("<h1>Not found</h1>", 404)
 
     @fastapi_app.get("/popout_data/{popout_id}")
     async def get_popout_data(popout_id: str):
-        with SESSION_LOCK:
-            for app in SESSION_APPS.values():
-                if app.popout_id == popout_id:
-                    _, rec, trans = app.get_current_display()
-                    return JSONResponse(
-                        {
-                            "recognized": rec,
-                            "translated": trans
-                            if app.settings["enable_translation"]
-                            else "",
-                        }
-                    )
+        app = await run_in_threadpool(find_app_by_popout_id, popout_id)
+        if app:
+            _, rec, trans = app.get_current_display()
+            return JSONResponse(
+                {
+                    "recognized": rec,
+                    "translated": trans if app.settings["enable_translation"] else "",
+                }
+            )
         return JSONResponse({"error": "Not found"}, 404)
 
     @fastapi_app.get("/fonts/{filename}")
