@@ -2055,13 +2055,25 @@ class VoiceTranslatorApp:
 
 # ── Global helpers ────────────────────────────────────────────────────────────
 def get_available_models() -> list[tuple[str, str]]:
+    """
+    Scan vosk_models/ for anything that actually looks like a real Vosk
+    model directory — not just any subdirectory. Every genuine Vosk model
+    (small, big, or lgraph variant) contains at least one of a handful of
+    well-known subfolders; without this check, a stray "temp" download
+    folder, a partial/failed extraction, or an unrelated folder someone
+    drops in there would show up as a selectable model and crash Vosk's
+    Model() constructor the moment anyone actually picked it.
+    """
     models_dir = Path("vosk_models")
     models_dir.mkdir(exist_ok=True)
-    return [
-        (item.name, str(item))
-        for item in models_dir.iterdir()
-        if item.is_dir() and not item.name.startswith(".")
-    ]
+    model_markers = ("am", "conf", "graph", "ivector", "rescore")
+    results = []
+    for item in sorted(models_dir.iterdir()):
+        if not item.is_dir() or item.name.startswith(".") or item.name == "temp":
+            continue
+        if any((item / marker).exists() for marker in model_markers):
+            results.append((item.name, str(item)))
+    return results
 
 
 def get_microphones() -> list[tuple[str, int]]:
@@ -3309,8 +3321,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             return {
                 session_info: f"### 🎯 Session: `{slug}` | Active: {len(SESSION_APPS)}",
                 popout_url: _popout_url(request, app),
-                vosk_model_dropdown: s["vosk_model"],
-                mic_dropdown: s.get("microphone"),
+                # Fresh choices, not the list from server start-up — a stale
+                # list caused "Value: X is not in the list of choices".
+                vosk_model_dropdown: gr.update(choices=models, value=s["vosk_model"]),
+                mic_dropdown: gr.update(
+                    choices=mics, value=s.get("microphone") if mics else None
+                ),
                 recognition_engine: s["recognition_engine"],
                 audio_mode: s["audio_mode"],
                 enable_translation: s["enable_translation"],
@@ -3420,13 +3436,26 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             # Also update subtitle manager and VAD with the new values
             app.apply_subtitle_settings()
             app.apply_vad_settings()
+
+            # Re-query what's actually on disk/available right now — same
+            # reasoning as handle_ui_load: a stale choices= list from
+            # server-startup time is what caused "Value: X is not in the
+            # list of choices" after downloading a model and refreshing.
+            models = get_available_models()
+            mics = get_microphones()
+            if models and not app.settings["vosk_model"]:
+                app.settings["vosk_model"] = models[0][1]
+            if mics and app.settings.get("microphone") not in [m[1] for m in mics]:
+                app.settings["microphone"] = mics[0][1]
             persist_settings(app.slug, app.settings)
 
             # Build the same output dictionary as handle_ui_load
             s = app.settings
             return {
-                vosk_model_dropdown: s["vosk_model"],
-                mic_dropdown: s.get("microphone"),
+                vosk_model_dropdown: gr.update(choices=models, value=s["vosk_model"]),
+                mic_dropdown: gr.update(
+                    choices=mics, value=s.get("microphone") if mics else None
+                ),
                 recognition_engine: s["recognition_engine"],
                 audio_mode: s["audio_mode"],
                 enable_translation: s["enable_translation"],
