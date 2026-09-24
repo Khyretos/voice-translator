@@ -136,3 +136,30 @@ class TestSettingsPath:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestPopoutId:
+    def test_popout_id_is_persistable(self):
+        assert "popout_id" in ss.PERSISTABLE_KEYS
+
+    def test_new_session_does_not_inherit_mains_popout_id(self):
+        # Two sessions sharing one popout id would fight over one OBS URL.
+        ss.SETTINGS_DIR.mkdir(parents=True)
+        (ss.SETTINGS_DIR / "main.json").write_text(
+            json.dumps({"vosk_model": "en", "popout_id": "stream-overlay"})
+        )
+        seeded = ss.load_saved_settings("discord")
+        assert seeded == {"vosk_model": "en"}
+
+    def test_own_popout_id_is_loaded(self):
+        ss.SETTINGS_DIR.mkdir(parents=True)
+        (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"popout_id": "abc"}))
+        assert ss.load_saved_settings("main")["popout_id"] == "abc"
+
+    def test_find_slug_by_popout_id(self):
+        ss.SETTINGS_DIR.mkdir(parents=True)
+        (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"popout_id": "abc"}))
+        (ss.SETTINGS_DIR / "khyretos.json").write_text(json.dumps({"popout_id": "obs1"}))
+        assert ss.find_slug_by_popout_id("obs1") == "khyretos"
+        assert ss.find_slug_by_popout_id("missing") is None
+        assert ss.find_slug_by_popout_id("") is None

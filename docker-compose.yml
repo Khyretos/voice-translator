@@ -24,6 +24,9 @@ services:
       # in-memory state freed (settings.json is never touched either way).
       # 0 = disabled (default). Uncomment to opt in, e.g. 6h:
       # - IDLE_SESSION_TIMEOUT_SECONDS=21600
+      # Optional: bot token for the "Discord Voice Channel" audio source, used
+      # by any session that leaves its own Bot token field empty. See DISCORD.md.
+      # - DISCORD_BOT_TOKEN=
     restart: unless-stopped
     networks:
       - outside

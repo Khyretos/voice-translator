@@ -140,3 +140,76 @@ class TestModeSwitching:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestSetTranslation:
+    def test_fills_in_translation_for_current_line(self):
+        sm = SubtitleManager(mode="instant", fade_timeout=5.0)
+        sm.add("hello there", "")
+        assert sm.get_display() == ("hello there", "")
+        sm.set_translation("hello there", "hola")
+        assert sm.get_display() == ("hello there", "hola")
+
+    def test_ignored_once_a_newer_line_replaced_it(self):
+        sm = SubtitleManager(mode="instant", fade_timeout=5.0)
+        sm.add("first", "")
+        sm.add("second", "")
+        sm.set_translation("first", "primero")
+        assert sm.get_display() == ("second", "")
+
+    def test_ignored_in_buffered_mode(self):
+        sm = SubtitleManager(mode="buffered", fade_timeout=5.0)
+        sm.add("first", "")
+        sm.set_translation("first", "primero")
+        assert sm.get_display()[1] == ""
+
+
+class TestSpeakerBoard:
+    def test_each_speaker_gets_own_line_in_start_order(self):
+        from subtitles import SpeakerBoard
+
+        b = SpeakerBoard(fade_timeout=5.0, max_speakers=4)
+        b.set_info("1", "Alice", "a.png")
+        b.add("1", "hello")
+        b.add("2", "hi there")
+        b.add("1", "how are you")  # Alice keeps her row position
+        rows = b.get_display()
+        assert [r["name"] for r in rows] == ["Alice", "User 2"]
+        assert rows[0]["rec"] == "how are you"
+        assert rows[0]["avatar"] == "a.png"
+
+    def test_rows_fade_independently(self, monkeypatch):
+        import subtitles
+        from subtitles import SpeakerBoard
+
+        now = [1000.0]
+        monkeypatch.setattr(subtitles.time, "time", lambda: now[0])
+        b = SpeakerBoard(fade_timeout=2.0)
+        b.add("1", "first")
+        now[0] += 1.5
+        b.add("2", "second")
+        now[0] += 1.0  # speaker 1 is 2.5 s old, speaker 2 is 1 s old
+        assert [r["id"] for r in b.get_display()] == ["2"]
+
+    def test_max_speakers_keeps_most_recent(self, monkeypatch):
+        import subtitles
+        from subtitles import SpeakerBoard
+
+        now = [1000.0]
+        monkeypatch.setattr(subtitles.time, "time", lambda: now[0])
+        b = SpeakerBoard(fade_timeout=10.0, max_speakers=2)
+        for uid in "123":
+            b.add(uid, f"line {uid}")
+            now[0] += 0.1
+        assert [r["id"] for r in b.get_display()] == ["2", "3"]
+
+    def test_translation_only_attaches_to_current_line(self):
+        from subtitles import SpeakerBoard
+
+        b = SpeakerBoard()
+        b.add("1", "one")
+        b.add("1", "two")
+        b.set_translation("1", "one", "uno")
+        assert b.get_display()[0]["tra"] == ""
+        b.set_translation("1", "two", "dos")
+        assert b.get_display()[0]["tra"] == "dos"

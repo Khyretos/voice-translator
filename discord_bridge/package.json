@@ -1,0 +1,19 @@
+{
+  "name": "voice-translator-discord-bridge",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Joins the Discord voice channel a user is in and streams each speaker's audio to voice_translator.py",
+  "main": "bridge.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.27.0",
+    "opusscript": "^0.0.8",
+    "prism-media": "^1.3.5"
+  },
+  "optionalDependencies": {
+    "@discordjs/opus": "^0.10.0"
+  }
+}

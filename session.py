@@ -37,6 +37,8 @@ that call get_slug(request) at all.
 
 import re
 import threading
+from collections import OrderedDict
+from urllib.parse import parse_qs, urlsplit
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -86,6 +88,7 @@ RESERVED_PATH_SEGMENTS = {
     "deactivate",
     "fonts",
     "active_sessions",
+    "session_stop",
     "favicon.ico",
 }
 
@@ -129,8 +132,18 @@ class SessionSlugMiddleware(BaseHTTPMiddleware):
 # the lifetime of that tab's connection, so every subsequent event handler
 # in that tab gets the right slug via a plain dict lookup, without needing
 # to touch every individual handler.
-_HASH_TO_SLUG: dict[str, str] = {}
+#
+# Entries are NOT removed when Gradio fires its `unload` event. Gradio fires
+# `unload` whenever the tab's heartbeat connection drops — which includes a
+# brief Wi-Fi blip, a laptop waking from sleep or a reverse proxy recycling
+# the connection, not just a real tab close. The browser then reconnects
+# with the *same* session_hash, so forgetting the mapping there left the tab
+# pointing at a ghost session named after its raw hash: Start/Stop and every
+# settings change silently went to the wrong session. The registry is
+# bounded by size instead (least-recently-used entries are evicted).
+_HASH_TO_SLUG: "OrderedDict[str, str]" = OrderedDict()
 _HASH_TO_SLUG_LOCK = threading.Lock()
+_HASH_TO_SLUG_MAX = 5000
 
 
 def register_slug(session_hash: str, slug: str) -> None:
@@ -138,28 +151,67 @@ def register_slug(session_hash: str, slug: str) -> None:
     slug = sanitize_slug(slug) or DEFAULT_SLUG
     with _HASH_TO_SLUG_LOCK:
         _HASH_TO_SLUG[session_hash] = slug
+        _HASH_TO_SLUG.move_to_end(session_hash)
+        while len(_HASH_TO_SLUG) > _HASH_TO_SLUG_MAX:
+            _HASH_TO_SLUG.popitem(last=False)
 
 
 def forget_session_hash(session_hash: str) -> None:
-    """Called from cleanup_user_data (tab close/reload) to bound the registry's size."""
+    """Explicitly drop one tab's mapping. No longer called on Gradio `unload` (see above)."""
     with _HASH_TO_SLUG_LOCK:
         _HASH_TO_SLUG.pop(session_hash, None)
+
+
+def slug_from_url(url: str | None) -> str | None:
+    """
+    Pull a session slug out of a page URL: `?session=<name>` first, then a
+    pretty `/<name>` path (the nginx rewrite from SESSIONS.md). None when the
+    URL names no session.
+    """
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    named = parse_qs(parts.query).get("session")
+    if named:
+        return sanitize_slug(named[0]) or None
+    seg = parts.path.strip("/").split("/")[0]
+    if seg and seg not in RESERVED_PATH_SEGMENTS:
+        return sanitize_slug(seg) or None
+    return None
 
 
 def get_slug(request) -> str:
     """
     Resolve the persistent session slug from within a Gradio event handler.
 
-    This is a lookup against the registry above, keyed by Gradio's own
+    Normally a lookup against the registry above, keyed by Gradio's own
     request.session_hash — which is reliably stable for every call from the
-    same tab, unlike a cookie (shared across all tabs) or the original
-    page's query string (not forwarded to Gradio's internal queue calls).
-    Falls back to session_hash itself if this tab hasn't called
-    handle_ui_load yet (shouldn't normally happen — it's the very first
-    thing that runs — but better than crashing).
+    same tab, unlike a cookie (shared across all tabs).
+
+    If this tab's hash isn't registered (the server restarted while the tab
+    stayed open, or the entry was evicted), the slug is recovered from the
+    page URL the browser sends as the Referer header — the page JS always
+    keeps `?session=<name>` in the address bar for this reason — and falls
+    back to DEFAULT_SLUG. It never falls back to the raw session_hash: that
+    used to silently create an unnamed ghost session.
     """
     session_hash = getattr(request, "session_hash", None)
-    if session_hash is None:
-        return DEFAULT_SLUG
-    with _HASH_TO_SLUG_LOCK:
-        return _HASH_TO_SLUG.get(session_hash, session_hash)
+    if session_hash is not None:
+        with _HASH_TO_SLUG_LOCK:
+            slug = _HASH_TO_SLUG.get(session_hash)
+        if slug:
+            return slug
+    headers = getattr(request, "headers", None)
+    referer = None
+    if headers is not None:
+        try:
+            referer = headers.get("referer")
+        except Exception:
+            referer = None
+    slug = slug_from_url(referer) or DEFAULT_SLUG
+    if session_hash is not None:
+        register_slug(session_hash, slug)
+    return slug

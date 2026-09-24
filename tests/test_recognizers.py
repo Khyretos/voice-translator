@@ -217,3 +217,35 @@ class TestArgosTranslatorUnavailable:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestHallucinationNormalizationAndLanguages:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Thank you!!",
+            "...Thank you.",
+            "♪♪",
+            "Sous-titres réalisés par la communauté d'Amara.org",
+            "Subtitles by the Amara.org community",
+            "Ondertiteling door TV Gelderland",
+            "Bedankt voor het kijken!",
+            "Untertitel im Auftrag des ZDF, 2021",
+            "Продолжение следует...",
+            "ご視聴ありがとうございました",
+            "Merci.",
+        ],
+    )
+    def test_blocked(self, text):
+        assert is_whisper_hallucination(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "I said thanks to Bob",
+            "Danke für die Hilfe mit dem Code heute",
+            "Merci pour ton aide avec le projet de ce soir",
+        ],
+    )
+    def test_real_speech_kept(self, text):
+        assert is_whisper_hallucination(text) is False

@@ -93,3 +93,77 @@ class TestFlushAndReset:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestMaxSegment:
+    def test_continuous_speech_is_cut_into_pieces(self):
+        # 5 s of uninterrupted speech with a 2 s cap should dispatch pieces
+        # while still speaking, instead of nothing until the speaker pauses.
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300, max_segment_ms=2000)
+        segments = []
+        for _ in range(50):  # 50 × 100 ms
+            segments += vad.process_chunk(tone_bytes(10))
+        assert len(segments) >= 2
+        assert vad.in_speech  # the tail is still an open utterance
+        for seg in segments:
+            assert len(seg) <= 2000 // 10 * _F_BYTES
+
+    def test_cut_prefers_the_quietest_recent_frame(self):
+        vad = FastVAD(threshold_db=-60.0, end_silence_ms=2000, max_segment_ms=2000)
+        # 1.5 s loud, 50 ms quieter (still "speech"), then loud until the cap.
+        segments = vad.process_chunk(tone_bytes(150))
+        segments += vad.process_chunk(tone_bytes(5, amplitude=600))
+        segments += vad.process_chunk(tone_bytes(60))
+        assert len(segments) == 1
+        # The cut lands inside the quiet stretch: head ≈ 1.5 s + preroll.
+        head_frames = len(segments[0]) // _F_BYTES
+        assert 150 <= head_frames <= 156
+
+    def test_zero_means_unlimited(self):
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300, max_segment_ms=0)
+        segments = []
+        for _ in range(50):
+            segments += vad.process_chunk(tone_bytes(10))
+        assert segments == []
+
+    def test_current_segment_exposes_open_utterance(self):
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300)
+        assert vad.current_segment() == b""
+        vad.process_chunk(tone_bytes(50))
+        assert vad.in_speech
+        assert vad.current_segment_ms() >= 500
+        assert len(vad.current_segment()) == vad.current_segment_ms() // 10 * _F_BYTES
+
+
+class TestTransientRejection:
+    """Desk knocks / clicks must never reach Whisper (they're what it
+    hallucinates "Thank you." / "Subscribe" on)."""
+
+    def test_desk_knock_followed_by_silence_is_not_dispatched(self):
+        # 30 ms loud burst + a long silence. The old check counted the
+        # silence wait as part of the "utterance" and sent this to Whisper.
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300)
+        segments = vad.process_chunk(tone_bytes(3, amplitude=30000))
+        segments += vad.process_chunk(silence_bytes(60))
+        assert segments == []
+
+    def test_short_burst_below_min_speech_is_rejected_and_counted(self):
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300, min_speech_ms=200)
+        segments = vad.process_chunk(tone_bytes(12))  # 120 ms
+        segments += vad.process_chunk(silence_bytes(60))
+        assert segments == []
+        assert vad.rejected == 1
+
+    def test_real_utterance_passes_with_trailing_silence_trimmed(self):
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300, min_speech_ms=200)
+        segments = vad.process_chunk(tone_bytes(40))  # 400 ms "speech"
+        segments += vad.process_chunk(silence_bytes(60))
+        assert len(segments) == 1
+        frames = len(segments[0]) // _F_BYTES
+        # speech + ≤ preroll + only ~100 ms of the 300 ms silence wait
+        assert 40 <= frames <= 40 + 6 + 10
+
+    def test_single_loud_frame_cannot_open_a_segment(self):
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=50)
+        vad.process_chunk(tone_bytes(1) + silence_bytes(1) + tone_bytes(1))
+        assert not vad.in_speech

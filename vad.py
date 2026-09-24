@@ -35,7 +35,15 @@ _F_MS = 10
 _F_SAMP = _F_RATE * _F_MS // 1000  # 160 samples
 _F_BYTES = _F_SAMP * 2  # 320 bytes (int16 mono)
 _PREROLL = 3  # frames before speech onset (~30 ms)
-_MIN_SPCH = 3  # frames to confirm speech (~30 ms)
+_MIN_SPCH = 3  # consecutive speech frames needed to open a segment (~30 ms)
+# Trailing silence kept on a dispatched segment. The end-of-speech wait
+# (vad_end_silence_ms, default 300 ms) is only a *decision* delay — sending
+# all of that silence to Whisper just gives it more nothing to "fill in",
+# which is where end-of-clip hallucinations ("Thank you.") come from.
+_TRAIL_KEEP_FRAMES = 10  # 100 ms
+# Default minimum amount of actual speech (voiced frames, not the whole
+# segment) for a segment to be sent at all. See min_speech_ms below.
+_DEFAULT_MIN_SPEECH_MS = 200
 # Minimum speech segment to dispatch to Whisper/Moonshine.
 # Segments shorter than this are almost always desk taps / breath / noise.
 # 500 ms = 50 frames.  Vosk is not affected (it handles segmentation itself).
@@ -46,6 +54,11 @@ _MIN_DISPATCH_FRAMES = _MIN_DISPATCH_MS // _F_MS  # 15
 # │  Each unit = 10 ms. Recommended range: 20 (200 ms) … 60 (600 ms).
 # └─ Set via settings["vad_end_silence_ms"] in the UI.
 _DEFAULT_END_SLNC_FRAMES = 30
+# When a segment reaches max_segment_ms it's cut at the quietest frame in
+# its last _CUT_SEARCH_FRAMES frames (the likeliest gap between words), so
+# continuous speech is dispatched in pieces instead of only once the speaker
+# finally pauses — the difference between live captions and a 20 s lag.
+_CUT_SEARCH_FRAMES = 100  # search the last 1 s for a cut point
 
 
 class FastVAD:
@@ -72,9 +85,19 @@ class FastVAD:
     _N_BINS = _N_FFT // 2 + 1  # 129 rfft bins
 
     def __init__(
-        self, threshold_db=-30.0, end_silence_ms=300, noise_filter_threshold=0.0
+        self,
+        threshold_db=-30.0,
+        end_silence_ms=300,
+        noise_filter_threshold=0.0,
+        max_segment_ms=0,
+        min_speech_ms=_DEFAULT_MIN_SPEECH_MS,
     ):
         self._end_silence_frames = max(2, end_silence_ms // _F_MS)
+        self._set_max_segment(max_segment_ms)
+        self._set_min_speech(min_speech_ms)
+        # Segments dropped for having too little actual speech (desk knocks,
+        # clicks, coughs) — the app logs this so the filter is visible.
+        self.rejected = 0
         self._set_threshold(threshold_db)
         self._set_noise_filter(noise_filter_threshold)
         self._reset()
@@ -104,6 +127,31 @@ class FastVAD:
     def update_end_silence_ms(self, ms):
         self._end_silence_frames = max(2, int(ms) // _F_MS)
 
+    def _set_max_segment(self, ms):
+        """0 (or anything shorter than the cut-search window) = unlimited."""
+        frames = int(ms or 0) // _F_MS
+        self._max_segment_frames = frames if frames > _CUT_SEARCH_FRAMES else 0
+
+    def update_max_segment_ms(self, ms):
+        self._set_max_segment(ms)
+
+    def _set_min_speech(self, ms):
+        """
+        Minimum *voiced* duration for a segment to be dispatched. The old
+        check counted the whole segment, including the preroll and the
+        end-of-speech silence wait — so a 10–30 ms desk knock followed by
+        300 ms of silence counted as a 330 ms "utterance" and was sent to
+        Whisper, which then hallucinated "Thank you" / "Subscribe" for it.
+        """
+        try:
+            ms = int(ms)
+        except (TypeError, ValueError):
+            ms = _DEFAULT_MIN_SPEECH_MS
+        self._min_voiced_frames = max(_MIN_SPCH, ms // _F_MS)
+
+    def update_min_speech_ms(self, ms):
+        self._set_min_speech(ms)
+
     def _set_noise_filter(self, level):
         self._filter_level = max(0.0, min(1.0, float(level)))
         # Over-subtraction factor 1→4; spectral floor 0.05→0.001
@@ -129,12 +177,39 @@ class FastVAD:
     def _reset(self):
         self._preroll: list[bytes] = []
         self._segment: list[bytes] = []
+        self._seg_rms: list[float] = []  # per-frame RMS, parallel to _segment
+        self._voiced = 0  # speech frames in the open segment
+        self._onset = 0  # consecutive speech frames seen while not yet in speech
         self._in_speech = False
         self._sil_count = 0
         self._leftover = b""
 
     def reset(self):
         self._reset()
+
+    @property
+    def in_speech(self) -> bool:
+        """True while an utterance is open (speech seen, end-of-speech not yet)."""
+        return self._in_speech
+
+    def current_segment(self) -> bytes:
+        """Audio of the utterance in progress so far (b"" when none) — for interim results."""
+        return b"".join(self._segment) if self._in_speech else b""
+
+    def current_segment_ms(self) -> int:
+        return len(self._segment) * _F_MS if self._in_speech else 0
+
+    def _cut_long_segment(self) -> bytes:
+        """Split an over-long open segment at its quietest recent frame; return the head."""
+        n = len(self._segment)
+        start = max(0, n - _CUT_SEARCH_FRAMES)
+        window = self._seg_rms[start:]
+        cut = start + int(np.argmin(window)) + 1  # keep the quiet frame in the head
+        head = b"".join(self._segment[:cut])
+        self._segment = self._segment[cut:]
+        self._seg_rms = self._seg_rms[cut:]
+        self._voiced = sum(1 for r in self._seg_rms if r >= self._rms_floor)
+        return head
 
     # ── vectorized block preprocessing ───────────────────────────────────────
     def _preprocess_block_array(
@@ -286,40 +361,68 @@ class FastVAD:
             else:
                 is_speech = True
 
-            if is_speech:
-                if not self._in_speech:
-                    self._segment = list(self._preroll) + [fb]
-                    self._in_speech = True
+            if not self._in_speech:
+                # Pre-roll keeps a little audio from before the onset so the
+                # first syllable isn't clipped; the onset itself must be
+                # _MIN_SPCH consecutive speech frames, so a single loud
+                # frame (a click) can't open a segment on its own.
+                self._preroll.append((fb, rms))
+                if len(self._preroll) > _PREROLL + _MIN_SPCH:
+                    self._preroll.pop(0)
+                if is_speech:
+                    self._onset += 1
+                    if self._onset >= _MIN_SPCH:
+                        self._segment = [f for f, _ in self._preroll]
+                        self._seg_rms = [r for _, r in self._preroll]
+                        self._voiced = self._onset
+                        self._in_speech = True
+                        self._sil_count = 0
+                        self._preroll = []
+                        self._onset = 0
+                else:
+                    self._onset = 0
+            else:
+                self._segment.append(fb)
+                self._seg_rms.append(rms)
+                if is_speech:
+                    self._voiced += 1
                     self._sil_count = 0
                 else:
-                    self._segment.append(fb)
-                    self._sil_count = 0
-                self._preroll.append(fb)
-                if len(self._preroll) > _PREROLL:
-                    self._preroll.pop(0)
-            else:
-                if self._in_speech:
-                    self._segment.append(fb)
                     self._sil_count += 1
                     if self._sil_count >= self._end_silence_frames:
-                        # Only dispatch segments long enough to contain real speech.
-                        # Short bursts (desk tap, breath, click that slipped past) are dropped.
-                        if len(self._segment) >= _MIN_DISPATCH_FRAMES:
-                            segments.append(b"".join(self._segment))
+                        # Drop most of the trailing silence, and only send
+                        # segments with enough real speech in them (see
+                        # _set_min_speech) — knocks, clicks and coughs are
+                        # never sent to the recognizer at all.
+                        keep = len(self._segment) - max(
+                            0, self._sil_count - _TRAIL_KEEP_FRAMES
+                        )
+                        if (
+                            self._voiced >= self._min_voiced_frames
+                            and keep >= _MIN_DISPATCH_FRAMES
+                        ):
+                            segments.append(b"".join(self._segment[:keep]))
+                        else:
+                            self.rejected += 1
                         self._segment = []
+                        self._seg_rms = []
+                        self._voiced = 0
                         self._in_speech = False
                         self._sil_count = 0
-                else:
-                    self._preroll.append(fb)
-                    if len(self._preroll) > _PREROLL:
-                        self._preroll.pop(0)
+
+            if (
+                self._in_speech
+                and self._max_segment_frames
+                and len(self._segment) >= self._max_segment_frames
+            ):
+                segments.append(self._cut_long_segment())
 
         self._leftover = tail
         return segments
 
     def flush(self) -> bytes | None:
         seg = None
-        if self._in_speech and len(self._segment) >= _MIN_SPCH:
+        if self._in_speech and self._voiced >= self._min_voiced_frames:
             seg = b"".join(self._segment)
         self._reset()
         return seg

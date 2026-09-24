@@ -125,10 +125,98 @@ _HALLUCINATION_PREFIXES_DISTINCTIVE: tuple[str, ...] = (
 )
 
 
+# Subtitle-credit / outro lines Whisper reproduces from its training data
+# (YouTube and TV subtitles) in other languages — matched anywhere in a short
+# result, since they never occur in real conversation. Lower-case.
+_HALLUCINATION_SUBSTRINGS: tuple[str, ...] = (
+    "amara.org",
+    "subtitles by",
+    "subtitled by",
+    "captions by",
+    "transcribed by",
+    "transcription by",
+    "sous-titres réalisés par",
+    "sous-titrage",
+    "untertitel im auftrag",
+    "untertitel von",
+    "untertitelung",
+    "ondertiteling",
+    "ondertitels",
+    "subtítulos realizados por",
+    "subtítulos por",
+    "sottotitoli creati",
+    "sottotitoli a cura",
+    "legendas pela comunidade",
+    "субтитры",
+    "редактор субтитров",
+    "продолжение следует",
+    "ご視聴ありがとうございました",
+    "字幕",
+    "請不吝點贊",
+    "謝謝觀看",
+    "感谢观看",
+    "구독과 좋아요",
+    "시청해 주셔서 감사합니다",
+)
+
+# Short "thanks for watching"-style fillers in other languages, matched as a
+# whole (normalized) result.
+_HALLUCINATIONS_MULTILINGUAL: set[str] = {
+    "bedankt voor het kijken",
+    "dank je wel",
+    "dankjewel",
+    "dank u wel",
+    "bedankt",
+    "danke",
+    "danke schön",
+    "vielen dank",
+    "danke fürs zuschauen",
+    "merci",
+    "merci beaucoup",
+    "merci d'avoir regardé",
+    "gracias",
+    "gracias por ver",
+    "muchas gracias",
+    "obrigado",
+    "obrigada",
+    "grazie",
+    "grazie per la visione",
+    "спасибо",
+    "спасибо за просмотр",
+    "ありがとうございました",
+    "谢谢",
+    "감사합니다",
+}
+
+_PUNCT_RE = re.compile(r"[\s.,!?¡¿…:;\"'“”‘’()\[\]♪♫~*-]+")
+
+
+def _normalize(text: str) -> str:
+    """Lower-case, and collapse punctuation/whitespace to single spaces."""
+    return _PUNCT_RE.sub(" ", text.lower()).strip()
+
+
+_HALLUCINATIONS_PLAIN = None
+_SUBSTRINGS_PLAIN = None
+
+
 def is_whisper_hallucination(text: str) -> bool:
     """Return True if text is a known Whisper hallucination / filler output."""
     normalized = text.strip().lower()
     if normalized in _WHISPER_HALLUCINATIONS:
+        return True
+    # Same check with punctuation ignored, so "Thank you!", "Thank you!!"
+    # and "...thank you." all match the "thank you" entry.
+    plain = _normalize(text)
+    if not plain:
+        return bool(normalized)  # only punctuation/symbols, e.g. "♪♪", "..."
+    global _HALLUCINATIONS_PLAIN, _SUBSTRINGS_PLAIN
+    if _HALLUCINATIONS_PLAIN is None:
+        _HALLUCINATIONS_PLAIN = {_normalize(h) for h in _WHISPER_HALLUCINATIONS} - {""}
+        _SUBSTRINGS_PLAIN = tuple(_normalize(m) for m in _HALLUCINATION_SUBSTRINGS)
+    if plain in _HALLUCINATIONS_PLAIN:
+        return True
+    if plain in _HALLUCINATIONS_MULTILINGUAL:
         return True
     # Exact-match alone misses real-world variation ("Thank you for
     # watching, don't forget to subscribe!" vs. the exact denylist entries).
@@ -138,14 +226,18 @@ def is_whisper_hallucination(text: str) -> bool:
     # skip this check entirely. Hallucinated fillers are almost always
     # short — that's what makes this a reasonable, conservative widening
     # rather than a blanket fuzzy match.
-    word_count = len(normalized.split())
+    word_count = len(plain.split())
     if word_count <= 4:
         for prefix in _HALLUCINATION_PREFIXES_GENERIC:
-            if normalized.startswith(prefix):
+            if plain.startswith(prefix):
                 return True
     if word_count <= 10:
         for prefix in _HALLUCINATION_PREFIXES_DISTINCTIVE:
-            if normalized.startswith(prefix):
+            if plain.startswith(prefix):
+                return True
+    if word_count <= 15:
+        for marker in _SUBSTRINGS_PLAIN:
+            if marker in plain:
                 return True
     return False
 
@@ -372,7 +464,7 @@ class WhisperRecognizer:
             kept.append(text)
         return " ".join(kept)
 
-    def transcribe(self, audio_bytes, sample_rate=16000, language=None):
+    def transcribe(self, audio_bytes, sample_rate=16000, language=None, timeout=30):
         try:
             buffer = io.BytesIO()
             with wave.open(buffer, "wb") as wf:
@@ -384,7 +476,7 @@ class WhisperRecognizer:
             files = {"file": ("audio.wav", buffer, "audio/wav")}
             data = self._build_data(language=language, task="transcribe")
             url = self.endpoint_url or f"{self.host}/audio/transcriptions"
-            response = self.session.post(url, files=files, data=data, timeout=30)
+            response = self.session.post(url, files=files, data=data, timeout=timeout)
             if response.status_code == 200:
                 return self._extract_text(response.json())
             else:
