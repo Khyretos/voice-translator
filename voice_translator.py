@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import gc
+import hashlib
+import html
 import json
 import os
 import queue
@@ -689,9 +691,24 @@ window.stopBrowserMicTest = function() {
 // page can re-attach its microphone.
 function vtRender(d) {
     var box = document.getElementById('vt-display');
-    if (box && typeof d.html === 'string' && box.__vtHtml !== d.html) {
-        box.innerHTML = d.html;
-        box.__vtHtml = d.html;
+    if (box && typeof d.html === 'string') {
+        var empty = !d.recognized && !d.translated;
+        var lines = box.querySelector('.vt-lines');
+        if (empty && lines && box.__vtHtml !== null) {
+            // Fade out what's on screen as one block (text + outline);
+            // don't swap in the empty version, which would drop the text
+            // instantly and leave only the fade of an empty block.
+            lines.style.opacity = '0';
+            box.__vtHtml = null;
+        } else if (!empty && box.__vtHtml !== d.html) {
+            box.innerHTML = d.html;
+            box.__vtHtml = d.html;
+        } else if (empty && !lines) {
+            box.innerHTML = d.html;
+            var l = box.querySelector('.vt-lines');
+            if (l) l.style.opacity = '0';
+            box.__vtHtml = null;
+        }
     }
     vtSetBox('recognized-output-text', d.recognized || '');
     vtSetBox('translated-output-text', d.translated || '');
@@ -799,6 +816,7 @@ class VoiceTranslatorApp:
         "translated_color": "#CCCCCC",
         "background_color": "#000000",
         "text_alignment": "center",
+        "vertical_alignment": "middle",  # top | middle | bottom (bottom = classic subtitles)
         "translation_position": "after",
         "recognition_engine": "vosk",
         "whisper_host": "http://localhost:9000",
@@ -861,6 +879,9 @@ class VoiceTranslatorApp:
         "whisper_translate_response_text_path": "",
         # VAD — threshold + end-of-speech delay are both hot-reloadable
         "vad_threshold": -30.0,  # dB — the slider value is now in dB directly
+        # Sounds with less actual speech than this (desk knocks, clicks,
+        # coughs) are never sent to Whisper — see FastVAD._set_min_speech.
+        "vad_min_speech_ms": 200,
         "vad_end_silence_ms": 300,  # ms of silence before dispatching (Whisper/Moonshine) — was 80ms, too short: natural mid-sentence pauses (breathing, thinking) routinely exceed that, so Whisper got flooded with tiny fragmented clips, which is exactly when it hallucinates fillers like "thank you"
         # Moonshine (moonshine-voice package)
         "moonshine_language": "en",
@@ -1034,6 +1055,7 @@ class VoiceTranslatorApp:
             self.vad.update_threshold(self.settings.get("vad_threshold", -30.0))
             self.vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 300))
             self.vad.update_max_segment_ms(self._max_segment_ms())
+            self.vad.update_min_speech_ms(self.settings.get("vad_min_speech_ms", 200))
             thresh = self.settings.get("noise_filter_threshold", 0.0)
             self.vad.update_noise_filter_threshold(thresh)
 
@@ -1190,6 +1212,7 @@ class VoiceTranslatorApp:
                 end_silence_ms=self.settings.get("vad_end_silence_ms", 300),
                 noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
                 max_segment_ms=self._max_segment_ms(),
+                min_speech_ms=self.settings.get("vad_min_speech_ms", 200),
             )
         return self.vad
 
@@ -1242,10 +1265,16 @@ class VoiceTranslatorApp:
         worker = self.whisper_worker
         if worker is None:
             return
+        rejected_before = vad.rejected
         for speech_bytes in vad.process_chunk(data):
             self.last_audio_chunk = speech_bytes
             worker.submit_final(speech_bytes)
             self._last_interim_at = time.monotonic()
+        if vad.rejected != rejected_before:
+            self.logger.log(
+                "Ignored a short non-speech sound (knock/click) — not sent to Whisper",
+                level="debug",
+            )
 
         # Live partial captions for the utterance still in progress — only
         # while the worker is otherwise idle, so they never delay a final.
@@ -1827,11 +1856,11 @@ class VoiceTranslatorApp:
             self.settings.get("translated_outline_color", "#000000"),
         )
 
-        # Fade: delegate entirely to SubtitleManager — if it returns empty strings we fade
-        opacity = "0" if (not recognized_text and not translated_text) else "1"
-
         def line_div(text, size, color, outline):
-            return f'<div style="font-size:{size}px;color:{color};{base_style}{outline}">{text}</div>'
+            return (
+                f'<div style="font-size:{size}px;color:{color};{base_style}{outline}">'
+                f"{html.escape(text)}</div>"
+            )
 
         parts = []
         if (
@@ -1870,14 +1899,23 @@ class VoiceTranslatorApp:
                 )
             )
 
+        # The frame (background) always stays; only the .vt-lines block
+        # fades. When the text goes empty the page's JS fades the block that
+        # is already on screen instead of swapping in an empty one, so the
+        # text and its outline disappear together (see vtRender).
         font_face = self._get_font_face_css()
+        valign = self._VERTICAL_MAP.get(
+            self.settings.get("vertical_alignment", "middle"), "center"
+        )
         return (
             f"<style>{font_face}</style>"
-            f'<div style="transition:opacity 0.5s;opacity:{opacity};display:flex;flex-direction:column;'
-            f"align-items:{alignment_map[self.settings['text_alignment']]};justify-content:center;"
+            f'<div style="display:flex;flex-direction:column;justify-content:{valign};'
             f'padding:20px;background-color:{self.settings["background_color"]};min-height:200px;">'
+            f'<div class="vt-lines" style="transition:opacity 0.5s;opacity:1;display:flex;'
+            f"flex-direction:column;align-items:{alignment_map[self.settings['text_alignment']]};"
+            f"text-align:{self.settings['text_alignment']};\">"
             + "".join(parts)
-            + "</div>"
+            + "</div></div>"
         )
 
     def get_current_display(self):
@@ -1973,9 +2011,19 @@ class VoiceTranslatorApp:
 
             return "", ""
 
+    _VERTICAL_MAP = {"top": "flex-start", "middle": "center", "bottom": "flex-end"}
+
+    def popout_style_key(self) -> str:
+        """Changes whenever anything baked into the popout page changes, so an
+        open popout (e.g. an OBS browser source) reloads itself to pick up new
+        styling instead of needing a manual refresh."""
+        return hashlib.md5(self.generate_popout_html().encode()).hexdigest()[:12]
+
     def generate_popout_html(self) -> str:
-        alignment_map = {"left": "flex-start", "center": "center", "right": "flex-end"}
-        fade_ms = int(self.settings.get("fade_timeout", 5.0) * 1000)
+        halign = self.settings.get("text_alignment", "center")
+        valign = self._VERTICAL_MAP.get(
+            self.settings.get("vertical_alignment", "middle"), "center"
+        )
         font_face = self._get_font_face_css()
         font_family = self._get_font_family_css()
         rec_outline = self._get_outline_css(
@@ -1986,37 +2034,58 @@ class VoiceTranslatorApp:
             self.settings.get("translated_outline_width", 0),
             self.settings.get("translated_outline_color", "#000000"),
         )
+        # Fading is driven by the server (the text comes back empty once the
+        # fade timeout / buffered hold is over). When that happens the page
+        # keeps the old text on screen and fades the whole block — text,
+        # outline and spacing together — and only empties it once the fade
+        # has finished. It used to blank the text instantly and then fade an
+        # empty container separately, which looked like a leftover box.
+        # Empty lines are hidden so they don't leave a gap either.
         return (
             f'<!DOCTYPE html><html><head><title>Display</title><meta charset="UTF-8">'
             f"<style>{font_face}"
             f"body,html{{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden;"
-            f"background:{self.settings['background_color']};display:flex;align-items:center;"
-            f"justify-content:{alignment_map[self.settings['text_alignment']]}}}"
-            f".container{{padding:20px;width:100%;text-align:{self.settings['text_alignment']};"
-            f"transition:opacity 1s;opacity:1}}.container.fade{{opacity:0}}"
+            f"background:{self.settings['background_color']};}}"
+            f"body{{display:flex;flex-direction:column;justify-content:{valign};}}"
+            f".container{{box-sizing:border-box;padding:20px;width:100%;"
+            f"text-align:{halign};transition:opacity 0.5s;opacity:1}}"
+            f".container.fade{{opacity:0}}"
+            f".rec,.tra{{margin:10px 0;font-family:{font_family};white-space:pre-wrap}}"
+            f".rec:empty,.tra:empty{{display:none}}"
             f".rec{{font-size:{self.settings['recognized_font_size']}px;"
-            f"color:{self.settings['recognized_color']};margin:10px 0;"
-            f"font-family:{font_family};{rec_outline}}}"
+            f"color:{self.settings['recognized_color']};{rec_outline}}}"
             f".tra{{font-size:{self.settings['translated_font_size']}px;"
-            f"color:{self.settings['translated_color']};margin:10px 0;"
-            f"font-family:{font_family};{trans_outline}}}"
+            f"color:{self.settings['translated_color']};{trans_outline}}}"
             f"</style>"
-            f"<script>let t=null;"
-            f'function reset(){{const c=document.getElementById("c");c.classList.remove("fade");'
-            f'if(t)clearTimeout(t);t=setTimeout(()=>c.classList.add("fade"),{fade_ms})}}'
-            f'async function update(){{try{{const r=await fetch("/popout_data/{self.popout_id}");'
-            f'const d=await r.json();const e=document.getElementById("r");'
-            f'const n=d.recognized||"";'
-            f"if(n!==e.textContent){{e.textContent=n;reset()}}"
-            f'document.getElementById("t").textContent=d.translated||""'
+            f"<script>"
+            f"let key=null;"
+            f'const $=id=>document.getElementById(id);'
+            f"async function update(){{try{{"
+            f'const r=await fetch("/popout_data/{self.popout_id}",{{cache:"no-store"}});'
+            f"if(!r.ok)return;const d=await r.json();"
+            f"if(d.style_key){{if(key===null)key=d.style_key;"
+            f"else if(d.style_key!==key){{location.reload();return}}}}"
+            f'const rec=d.recognized||"",tra=d.translated||"";'
+            f'const c=$("c");'
+            f"if(rec||tra){{"
+            f'if($("r").textContent!==rec)$("r").textContent=rec;'
+            f'if($("t").textContent!==tra)$("t").textContent=tra;'
+            f'c.classList.remove("fade")'
+            f'}}else c.classList.add("fade")'
             f"}}catch(e){{}}}}"
-            f"setInterval(update,150);"
-            f'document.addEventListener("DOMContentLoaded",()=>{{update();reset()}});</script>'
+            f'document.addEventListener("DOMContentLoaded",()=>{{'
+            f'$("c").addEventListener("transitionend",()=>{{'
+            f'if($("c").classList.contains("fade")){{$("r").textContent="";$("t").textContent=""}}}});'
+            f"update();setInterval(update,150)}});"
+            f"</script>"
             f"</head><body>"
-            f'<div id="c" class="container">'
-            f'<div id="r" class="rec"></div>'
-            f'<div id="t" class="tra"></div>'
-            f"</div></body></html>"
+            f'<div id="c" class="container fade">'
+            + (
+                '<div id="t" class="tra"></div><div id="r" class="rec"></div>'
+                if self.settings.get("translation_position") == "before"
+                else '<div id="r" class="rec"></div><div id="t" class="tra"></div>'
+            )
+            + "</div></body></html>"
         )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -2606,6 +2675,18 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             "'thank you'. Raise further (500–800ms) if it's still cutting "
                             "off mid-sentence; lower it if replies feel laggy.",
                         )
+                    vad_min_speech_ms = gr.Slider(
+                        minimum=50,
+                        maximum=800,
+                        value=200,
+                        step=10,
+                        label="Ignore sounds shorter than (ms)",
+                        info="Whisper only. A sound needs at least this much actual speech "
+                        "to be sent — desk knocks, clicks and coughs fall below it, and "
+                        "those are exactly what Whisper turns into 'Thank you' / "
+                        "'Subscribe'. Raise if knocks still get through; lower if very "
+                        "short replies ('yes', 'no') get dropped.",
+                    )
                     audio_watchdog_seconds = gr.Slider(
                         minimum=0,
                         maximum=60,
@@ -2930,9 +3011,17 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         background_color = gr.ColorPicker(
                             label="Background", value="#000000"
                         )
-                    text_alignment = gr.Radio(
-                        ["left", "center", "right"], value="center", label="Align"
-                    )
+                    with gr.Row():
+                        text_alignment = gr.Radio(
+                            ["left", "center", "right"], value="center", label="Align"
+                        )
+                        vertical_alignment = gr.Radio(
+                            [("Top", "top"), ("Middle", "middle"), ("Bottom", "bottom")],
+                            value="middle",
+                            label="Vertical position",
+                            info="Bottom + a popout the size of your stream = "
+                            "classic subtitles",
+                        )
                     translation_position = gr.Radio(
                         ["before", "after"], value="after", label="Translation position"
                     )
@@ -3341,6 +3430,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 translated_color: s["translated_color"],
                 background_color: s["background_color"],
                 text_alignment: s["text_alignment"],
+                vertical_alignment: s["vertical_alignment"],
                 translation_position: s["translation_position"],
                 whisper_host: s["whisper_host"],
                 whisper_api_key: s["whisper_api_key"],
@@ -3413,6 +3503,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 translated_outline_color: s["translated_outline_color"],
                 vad_threshold: _migrate_vad_threshold(s["vad_threshold"]),
                 vad_end_silence_ms: s["vad_end_silence_ms"],
+                vad_min_speech_ms: s["vad_min_speech_ms"],
                 subtitle_mode: s["subtitle_mode"],
                 subtitle_cps: s["subtitle_cps"],
                 subtitle_max_lines: s["subtitle_max_lines"],
@@ -3470,6 +3561,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 translated_color: s["translated_color"],
                 background_color: s["background_color"],
                 text_alignment: s["text_alignment"],
+                vertical_alignment: s["vertical_alignment"],
                 translation_position: s["translation_position"],
                 whisper_host: s["whisper_host"],
                 whisper_api_key: s["whisper_api_key"],
@@ -3542,6 +3634,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 translated_outline_color: s["translated_outline_color"],
                 vad_threshold: s["vad_threshold"],
                 vad_end_silence_ms: s["vad_end_silence_ms"],
+                vad_min_speech_ms: s["vad_min_speech_ms"],
                 subtitle_mode: s["subtitle_mode"],
                 subtitle_cps: s["subtitle_cps"],
                 subtitle_max_lines: s["subtitle_max_lines"],
@@ -3740,6 +3833,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         translated_color.change(_set("translated_color"), [translated_color])
         background_color.change(_set("background_color"), [background_color])
         text_alignment.change(_set("text_alignment"), [text_alignment])
+        vertical_alignment.change(_set("vertical_alignment"), [vertical_alignment])
         translation_position.change(
             _set("translation_position"), [translation_position]
         )
@@ -3763,6 +3857,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         # VAD — dynamic, no restart needed
         vad_threshold.change(_set_vad("vad_threshold"), [vad_threshold])
         vad_end_silence_ms.change(_set_vad("vad_end_silence_ms"), [vad_end_silence_ms])
+        vad_min_speech_ms.change(_set_vad("vad_min_speech_ms"), [vad_min_speech_ms])
         noise_filter_threshold.change(
             _set_vad("noise_filter_threshold"), [noise_filter_threshold]
         )
@@ -3919,6 +4014,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 translated_color,
                 background_color,
                 text_alignment,
+                vertical_alignment,
                 translation_position,
                 whisper_host,
                 whisper_api_key,
@@ -3973,6 +4069,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 translated_outline_color,
                 vad_threshold,
                 vad_end_silence_ms,
+                vad_min_speech_ms,
                 subtitle_mode,
                 subtitle_cps,
                 subtitle_max_lines,
@@ -4053,6 +4150,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 translated_color,
                 background_color,
                 text_alignment,
+                vertical_alignment,
                 translation_position,
                 whisper_host,
                 whisper_api_key,
@@ -4107,6 +4205,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 translated_outline_color,
                 vad_threshold,
                 vad_end_silence_ms,
+                vad_min_speech_ms,
                 subtitle_mode,
                 subtitle_cps,
                 subtitle_max_lines,
@@ -4326,6 +4425,7 @@ if __name__ == "__main__":
                 {
                     "recognized": rec,
                     "translated": trans if app.settings["enable_translation"] else "",
+                    "style_key": app.popout_style_key(),
                 }
             )
         return JSONResponse({"error": "Not found"}, 404)

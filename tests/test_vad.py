@@ -133,3 +133,37 @@ class TestMaxSegment:
         assert vad.in_speech
         assert vad.current_segment_ms() >= 500
         assert len(vad.current_segment()) == vad.current_segment_ms() // 10 * _F_BYTES
+
+
+class TestTransientRejection:
+    """Desk knocks / clicks must never reach Whisper (they're what it
+    hallucinates "Thank you." / "Subscribe" on)."""
+
+    def test_desk_knock_followed_by_silence_is_not_dispatched(self):
+        # 30 ms loud burst + a long silence. The old check counted the
+        # silence wait as part of the "utterance" and sent this to Whisper.
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300)
+        segments = vad.process_chunk(tone_bytes(3, amplitude=30000))
+        segments += vad.process_chunk(silence_bytes(60))
+        assert segments == []
+
+    def test_short_burst_below_min_speech_is_rejected_and_counted(self):
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300, min_speech_ms=200)
+        segments = vad.process_chunk(tone_bytes(12))  # 120 ms
+        segments += vad.process_chunk(silence_bytes(60))
+        assert segments == []
+        assert vad.rejected == 1
+
+    def test_real_utterance_passes_with_trailing_silence_trimmed(self):
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=300, min_speech_ms=200)
+        segments = vad.process_chunk(tone_bytes(40))  # 400 ms "speech"
+        segments += vad.process_chunk(silence_bytes(60))
+        assert len(segments) == 1
+        frames = len(segments[0]) // _F_BYTES
+        # speech + ≤ preroll + only ~100 ms of the 300 ms silence wait
+        assert 40 <= frames <= 40 + 6 + 10
+
+    def test_single_loud_frame_cannot_open_a_segment(self):
+        vad = FastVAD(threshold_db=-40.0, end_silence_ms=50)
+        vad.process_chunk(tone_bytes(1) + silence_bytes(1) + tone_bytes(1))
+        assert not vad.in_speech

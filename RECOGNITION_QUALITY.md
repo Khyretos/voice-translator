@@ -156,3 +156,29 @@ The debug log shows each request as `Whisper final: 2.8s audio in 0.41s`.
 If that second number is regularly larger than the first, the Whisper server
 itself is slower than real time (e.g. a large model on CPU) — a smaller model
 (`small`, `medium`, `large-v3-turbo`) or a GPU is the fix there.
+
+## Round 3: knocks, clicks and silence still turning into "Thank you"
+
+The real leak was in the VAD, not Whisper: the "minimum length" check
+counted the *whole* segment, including the pre-roll and the end-of-speech
+silence wait. A 10–30 ms desk knock followed by the default 300 ms wait
+counted as a 330 ms utterance, passed the 300 ms minimum, and was sent to
+Whisper — which, given a click and silence, reproduces its YouTube training
+data ("Thank you.", "Subscribe", "Subtitles by the Amara.org community").
+
+Fixed without adding latency:
+
+- **Minimum *speech*, not minimum length.** A segment is only sent if it
+  contains at least *Ignore sounds shorter than* (default 200 ms) of frames
+  that actually passed the voice check. Knocks, clicks and coughs are
+  dropped before any request is made (logged at debug level).
+- **Onset confirmation.** A segment opens only after 3 consecutive speech
+  frames (30 ms), so a single loud frame can't start one.
+- **Trailing silence trimmed.** Only 100 ms of the end-of-speech wait is
+  sent; the rest was just silence for Whisper to "fill in". This also makes
+  each request slightly smaller.
+- **Wider text filter** as the last line of defence: punctuation-insensitive
+  matching ("Thank you!!", "...thank you."), results that are only symbols
+  ("♪♪"), and the well-known subtitle-credit / "thanks for watching" lines
+  Whisper produces in other languages (Amara.org, "Untertitel im Auftrag
+  des ZDF", "Ondertiteling …", "Продолжение следует", "ご視聴ありがとうございました", …).
