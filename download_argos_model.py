@@ -9,10 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 current_directory = os.getcwd()
 print("Current Directory:", current_directory)
 try:
@@ -37,9 +33,6 @@ def update_package_index():
     """Update Argos package index"""
     print("\n📦 Updating package index...")
     try:
-        argostranslate.package.settings.package_dir = str(
-            os.environ.get("ARGOS_PACKAGE_DIR", "Not found")
-        )
         argostranslate.package.update_package_index()
         print("✓ Package index updated")
         return True
@@ -135,13 +128,13 @@ def install_bidirectional(lang1, lang2, available_packages):
     success2 = install_language_pair(lang2, lang1, available_packages)
 
     if success1 and success2:
-        print(f"✓ Bidirectional installation complete")
+        print("✓ Bidirectional installation complete")
         return True
     elif success1 or success2:
-        print(f"⚠️  Partial installation (one direction failed)")
+        print("⚠️  Partial installation (one direction failed)")
         return True
     else:
-        print(f"✗ Installation failed")
+        print("✗ Installation failed")
         return False
 
 

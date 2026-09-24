@@ -84,6 +84,7 @@ _AUDIO_BACKLOG_KEEP_BLOCKS = 10
 _HW_WATCHDOG_MAX_S = 3.0  # a server device calls back every 30 ms, even in silence
 _BROWSER_START_GRACE_S = 30.0  # time for the mic prompt / screen-share picker
 
+
 # ── Font helpers ──────────────────────────────────────────────────────────────
 def get_available_fonts():
     """Scan the fonts/ directory for supported font files."""
@@ -368,7 +369,64 @@ var VTResamplerMain = (new Function(VT_RESAMPLER_SRC + '; return VTResampler;'))
 // sourceType: 'mic' (getUserMedia, this device's microphone) or 'display'
 // (getDisplayMedia — a shared browser tab/window/screen, with its audio —
 // e.g. a Discord web tab, or on Windows/ChromeOS, whole-system audio).
-function vtGetMedia(sourceType) {
+// ── WebSocket connect + auto-reconnect ─────────────────────────────────────
+// The original version never reconnected on an unexpected close — any brief
+// network blip, a reverse-proxy idle timeout, or a server restart silently
+// killed the pipeline forever: the mic itself kept recording (nothing told
+// it to stop), so the volume meter could still move, but nothing was being
+// sent anymore. That contradiction ("meter moves, nothing transcribes") is
+// exactly what "the mic just disconnects, I don't know what's going on"
+// looks like from the outside. Now it retries with backoff automatically,
+// with the media stream untouched throughout — no need to re-ask for mic
+// permission or re-pick a tab/screen to share.
+window.__connectAudioWs = function(wsPath) {
+    var wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var ws = new WebSocket(wsProtocol + '//' + window.location.host + wsPath);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = function() {
+        window.__wsReconnectAttempts = 0;
+        setStatus('Streaming...');
+    };
+
+    ws.onerror = function() {
+        // onclose always fires right after onerror for a WebSocket — let
+        // onclose (below) own the single decision of what happens next,
+        // so there's exactly one reconnect-or-not code path, not two that
+        // could disagree with each other.
+    };
+
+    ws.onclose = function() {
+        window.__websocket = null;
+        if (window.__wsIntentionalClose || !window.__audioStreamActive) {
+            setStatus('Stopped');
+            updateVolumeMeter(0);
+            return;
+        }
+        window.__wsReconnectAttempts = (window.__wsReconnectAttempts || 0) + 1;
+        // Capped exponential backoff: 1s, 2s, 4s, 8s, then holds at 10s —
+        // fast enough to recover quickly from a brief blip, gentle enough
+        // not to hammer the server if it's actually down for a while.
+        // Keeps retrying indefinitely, same "permanent until you stop it"
+        // philosophy as the sessions themselves.
+        var delayMs = Math.min(10000, 1000 * Math.pow(2, window.__wsReconnectAttempts - 1));
+        setStatus('Reconnecting (attempt ' + window.__wsReconnectAttempts + ')...');
+        window.__wsReconnectTimer = setTimeout(function() {
+            if (window.__audioStreamActive && !window.__wsIntentionalClose) {
+                window.__connectAudioWs(wsPath);
+            }
+        }, delayMs);
+    };
+
+    window.__websocket = ws;
+};
+
+window.__startAudioCapture = function(withWs, sourceType) {
+    sourceType = sourceType || 'mic';
+    var sessionDiv = document.getElementById('session-data');
+    if (!sessionDiv) { setStatus('Error: session data missing'); window.__audioStreamActive = false; window.__micTestActive = false; return; }
+
+    var mediaPromise;
     if (sourceType === 'display') {
         // video:true is required by the getDisplayMedia spec even though we
         // discard the track immediately below — only the audio is used.
@@ -422,16 +480,14 @@ async function vtOpenCapture(sourceType, onChunk) {
              sourceType: sourceType, closed: false, onLost: null };
 }
 
-function vtCloseCapture(cap) {
-    if (!cap || cap.closed) return;
-    cap.closed = true;
-    try { if (cap.node.port) cap.node.port.onmessage = null; } catch (e) {}
-    try { cap.node.onaudioprocess = null; } catch (e) {}
-    try { cap.source.disconnect(); } catch (e) {}
-    try { cap.node.disconnect(); } catch (e) {}
-    cap.stream.getTracks().forEach(function(t) { t.onended = null; try { t.stop(); } catch (e) {} });
-    try { cap.ctx.onstatechange = null; cap.ctx.close(); } catch (e) {}
-}
+            if (withWs) {
+                var wsPath = sessionDiv.dataset.wsPath;
+                window.__wsIntentionalClose = false;
+                window.__wsReconnectAttempts = 0;
+                window.__connectAudioWs(wsPath);
+            } else {
+                setStatus('Mic test active...');
+            }
 
 // Detect the source going away, and keep the AudioContext running.
 function vtWatchCapture(cap) {
@@ -640,12 +696,16 @@ window.startBrowserStreaming = function() {
     vtStartStreaming(window.__getAudioSourceType(), false);
 };
 
-// Called after the server's start handler returns: if it failed, stop the
-// audio we started for it.
-window.vtAfterStart = function(status) {
-    if (typeof status === 'string' && status.indexOf('❌') === 0 && VT.wantStream) {
-        vtStopStreaming('Stopped');
-    }
+window.__stopAudioCapture = function() {
+    window.__wsIntentionalClose = true;
+    if (window.__wsReconnectTimer) { clearTimeout(window.__wsReconnectTimer); window.__wsReconnectTimer = null; }
+    if (window.__audioProcessor)  { window.__audioProcessor.disconnect(); window.__audioProcessor = null; }
+    if (window.__audioSource)     { window.__audioSource.disconnect(); window.__audioSource = null; }
+    if (window.__mediaStream)     { window.__mediaStream.getTracks().forEach(function(t){t.stop();}); window.__mediaStream = null; }
+    if (window.__audioContext)    { window.__audioContext.close(); window.__audioContext = null; }
+    if (window.__websocket)       { window.__websocket.close(); window.__websocket = null; }
+    if (window.__volumeMeterInterval) { clearInterval(window.__volumeMeterInterval); window.__volumeMeterInterval = null; }
+    updateVolumeMeter(0);
 };
 
 window.stopBrowserStreaming = function() {
@@ -779,6 +839,7 @@ vtWhenReady(function() {
 
 # SubtitleManager now lives in subtitles.py — imported above.
 
+
 # ── VoiceTranslatorApp ────────────────────────────────────────────────────────
 class VoiceTranslatorApp:
     # Default settings – overridden by saved settings on load
@@ -897,7 +958,9 @@ class VoiceTranslatorApp:
 
         self.recognizer = None
         self.model = None
-        self._vosk_model_path: str | None = None  # which path self.model is a shared reference to — needed by _unload_vosk to release the right cache entry
+        self._vosk_model_path: str | None = (
+            None  # which path self.model is a shared reference to — needed by _unload_vosk to release the right cache entry
+        )
         self.whisper_recognizer: WhisperRecognizer | None = None
         self.moonshine_recognizer: MoonshineRecognizer | None = None
         self.argos_translator: ArgosTranslator | None = None
@@ -1269,14 +1332,18 @@ class VoiceTranslatorApp:
         if not transcription or dots_or_stars(transcription):
             return ""
         if is_whisper_hallucination(transcription):
-            self.logger.log(f"Blocked hallucination: {repr(transcription)}", level="debug")
+            self.logger.log(
+                f"Blocked hallucination: {repr(transcription)}", level="debug"
+            )
             return ""
         if not self.is_valid_transcription(transcription):
             self.logger.log("Discarded invalid transcription", level="debug")
             return ""
         return transcription
 
-    def _whisper_transcribe(self, rec: WhisperRecognizer, audio: bytes, interim: bool) -> str:
+    def _whisper_transcribe(
+        self, rec: WhisperRecognizer, audio: bytes, interim: bool
+    ) -> str:
         """LiveWhisperWorker's transcribe_fn."""
         return rec.transcribe(
             audio,
@@ -1424,7 +1491,11 @@ class VoiceTranslatorApp:
                 self.logger.log(
                     "Whisper live mode: "
                     + ("greedy decoding" if low_latency else "beam search")
-                    + (", interim captions on" if self.settings.get("whisper_interim", True) else "")
+                    + (
+                        ", interim captions on"
+                        if self.settings.get("whisper_interim", True)
+                        else ""
+                    )
                     + f", max segment {self._max_segment_ms() / 1000:.0f}s",
                     level="info",
                 )
@@ -1627,9 +1698,7 @@ class VoiceTranslatorApp:
             # Let the worker finish the last utterance (in the background, so
             # Stop returns immediately), then release it.
             if self.whisper_worker:
-                threading.Thread(
-                    target=self.whisper_worker.close, daemon=True
-                ).start()
+                threading.Thread(target=self.whisper_worker.close, daemon=True).start()
                 self.whisper_worker = None
 
             # Unload Vosk model to free memory
@@ -1771,9 +1840,7 @@ class VoiceTranslatorApp:
                 no_speech_threshold=self.settings[
                     "whisper_translate_no_speech_threshold"
                 ],
-                logprob_threshold=self.settings[
-                    "whisper_translate_logprob_threshold"
-                ],
+                logprob_threshold=self.settings["whisper_translate_logprob_threshold"],
                 compression_ratio_threshold=self.settings[
                     "whisper_translate_compression_ratio_threshold"
                 ],
@@ -2055,13 +2122,25 @@ class VoiceTranslatorApp:
 
 # ── Global helpers ────────────────────────────────────────────────────────────
 def get_available_models() -> list[tuple[str, str]]:
+    """
+    Scan vosk_models/ for anything that actually looks like a real Vosk
+    model directory — not just any subdirectory. Every genuine Vosk model
+    (small, big, or lgraph variant) contains at least one of a handful of
+    well-known subfolders; without this check, a stray "temp" download
+    folder, a partial/failed extraction, or an unrelated folder someone
+    drops in there would show up as a selectable model and crash Vosk's
+    Model() constructor the moment anyone actually picked it.
+    """
     models_dir = Path("vosk_models")
     models_dir.mkdir(exist_ok=True)
-    return [
-        (item.name, str(item))
-        for item in models_dir.iterdir()
-        if item.is_dir() and not item.name.startswith(".")
-    ]
+    model_markers = ("am", "conf", "graph", "ivector", "rescore")
+    results = []
+    for item in sorted(models_dir.iterdir()):
+        if not item.is_dir() or item.name.startswith(".") or item.name == "temp":
+            continue
+        if any((item / marker).exists() for marker in model_markers):
+            results.append((item.name, str(item)))
+    return results
 
 
 def get_microphones() -> list[tuple[str, int]]:
@@ -2110,7 +2189,9 @@ def _migrate_vad_threshold(v) -> float:
 # Moonshine (small ONNX models with per-session streaming state that can't be
 # shared) aren't included — see RECOGNITION_QUALITY.md / MODEL_SHARING.md.
 _VOSK_MODEL_LOCK = threading.Lock()
-_VOSK_MODEL_CACHE: dict[str, dict] = {}  # model_path -> {"model": Model, "refcount": int}
+_VOSK_MODEL_CACHE: dict[
+    str, dict
+] = {}  # model_path -> {"model": Model, "refcount": int}
 
 
 def _acquire_vosk_model(model_path: str) -> Model:
@@ -2121,9 +2202,7 @@ def _acquire_vosk_model(model_path: str) -> Model:
             entry = {"model": Model(model_path), "refcount": 0}
             _VOSK_MODEL_CACHE[model_path] = entry
         entry["refcount"] += 1
-        print(
-            f"[VOSK] '{model_path}' now shared by {entry['refcount']} session(s)"
-        )
+        print(f"[VOSK] '{model_path}' now shared by {entry['refcount']} session(s)")
         return entry["model"]
 
 
@@ -2151,9 +2230,11 @@ def _release_vosk_model(model_path: str | None):
 
 def _source_ended_reason(detail: str) -> str:
     detail = re.sub(r"[^\w .,:'()-]", "", str(detail or ""))[:80]
-    return "🔌 Browser audio source ended" + (
-        f" ({detail})" if detail else ""
-    ) + " — session stopped"
+    return (
+        "🔌 Browser audio source ended"
+        + (f" ({detail})" if detail else "")
+        + " — session stopped"
+    )
 
 
 def get_or_create_app(slug: str) -> VoiceTranslatorApp:
@@ -2289,7 +2370,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         )
                         open_session_btn = gr.Button("↗️ Go", scale=1, size="sm")
                         random_session_btn = gr.Button(
-                            "🎲 New", scale=1, size="sm",
+                            "🎲 New",
+                            scale=1,
+                            size="sm",
                             elem_id="random-session-btn",
                         )
                     session_dropdown = gr.Dropdown(
@@ -3144,7 +3227,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 host = headers.get("x-forwarded-host") or headers.get("host")
                 if host:
                     proto = headers.get("x-forwarded-proto") or "http"
-                    base = f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+                    base = (
+                        f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+                    )
             except Exception:
                 pass
             return f"{base}/popout/{app.popout_id}"
@@ -3260,6 +3345,28 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         def stop_rec(request: gr.Request):
             return get_or_create_app(get_slug(request)).stop_recognition()
 
+        def update_display(js_slug, request: gr.Request):
+            # Re-registering here on every 50ms tick (not just once at page
+            # load) is the actual fix for the ghost-session bug: Gradio's
+            # frontend can issue a *new* session_hash mid-session on its own
+            # internal reconnect (e.g. after Chrome freezes/resumes a
+            # backgrounded tab — see SESSIONS.md), and the old registration
+            # was only ever set once, at initial load. A stale/unregistered
+            # session_hash fell through to get_slug()'s raw-hash fallback,
+            # silently spinning up a brand new, empty "ghost" session — so
+            # the dashboard went blank even though the real session (with
+            # its actual recognition) kept running untouched in the
+            # background. js_slug is read fresh from this tab's DOM/
+            # sessionStorage state on every call, which survives a
+            # reconnect even when the session_hash itself doesn't, so this
+            # keeps the registry correct within one tick either way.
+            register_slug(request.session_hash, js_slug)
+            return get_or_create_app(js_slug).get_current_display()
+
+        def update_logs(js_slug, request: gr.Request):
+            register_slug(request.session_hash, js_slug)
+            return get_or_create_app(js_slug).update_logs()
+
         def cleanup_user_data(request: gr.Request):
             # Tabs closing / reloading no longer destroys the session — a
             # session now lives until the user explicitly closes it (via the
@@ -3308,9 +3415,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
 
             return {
                 session_info: f"### 🎯 Session: `{slug}` | Active: {len(SESSION_APPS)}",
-                popout_url: _popout_url(request, app),
-                vosk_model_dropdown: s["vosk_model"],
-                mic_dropdown: s.get("microphone"),
+                popout_url: f"http://{args.host}:{args.port}/popout/{app.popout_id}",
+                vosk_model_dropdown: gr.update(choices=models, value=s["vosk_model"]),
+                mic_dropdown: gr.update(choices=mics, value=s.get("microphone")),
                 recognition_engine: s["recognition_engine"],
                 audio_mode: s["audio_mode"],
                 enable_translation: s["enable_translation"],
@@ -3420,13 +3527,24 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             # Also update subtitle manager and VAD with the new values
             app.apply_subtitle_settings()
             app.apply_vad_settings()
+
+            # Re-query what's actually on disk/available right now — same
+            # reasoning as handle_ui_load: a stale choices= list from
+            # server-startup time is what caused "Value: X is not in the
+            # list of choices" after downloading a model and refreshing.
+            models = get_available_models()
+            mics = get_microphones()
+            if models and not app.settings["vosk_model"]:
+                app.settings["vosk_model"] = models[0][1]
+            if mics and app.settings.get("microphone") not in [m[1] for m in mics]:
+                app.settings["microphone"] = mics[0][1]
             persist_settings(app.slug, app.settings)
 
             # Build the same output dictionary as handle_ui_load
             s = app.settings
             return {
-                vosk_model_dropdown: s["vosk_model"],
-                mic_dropdown: s.get("microphone"),
+                vosk_model_dropdown: gr.update(choices=models, value=s["vosk_model"]),
+                mic_dropdown: gr.update(choices=mics, value=s.get("microphone")),
                 recognition_engine: s["recognition_engine"],
                 audio_mode: s["audio_mode"],
                 enable_translation: s["enable_translation"],
@@ -3815,9 +3933,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         }
         """
         open_session_btn.click(fn=None, inputs=[new_session_name], js=_OPEN_SESSION_JS)
-        new_session_name.submit(
-            fn=None, inputs=[new_session_name], js=_OPEN_SESSION_JS
-        )
+        new_session_name.submit(fn=None, inputs=[new_session_name], js=_OPEN_SESSION_JS)
         random_session_btn.click(
             fn=None,
             js="""
@@ -3862,9 +3978,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             fn=start_rec, outputs=[status_text], js="startBrowserStreaming"
         ).then(
             fn=None, inputs=[status_text], js="(s) => { window.vtAfterStart(s); }"
-        ).then(
-            fn=lambda: gr.update(visible=False), outputs=[stop_test_mic_btn]
-        ).then(fn=None, js="startHwLevelPolling")
+        ).then(fn=lambda: gr.update(visible=False), outputs=[stop_test_mic_btn]).then(
+            fn=None, js="startHwLevelPolling"
+        )
 
         # Stop — stop HW polling too
         stop_btn.click(
@@ -3957,14 +4073,13 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             ],
         )
 
-        # ── Display / logs / session-state polling ────────────────────────────
-        # Done by the page's own JS (startAllPolling) with plain fetch() calls
-        # to /display_data and /logs_data. This used to be a gr.Timer(0.05):
-        # 20 Gradio queue events per second per open tab, all through the
-        # same connection as every button click. When anything slowed that
-        # connection (a backgrounded tab, a proxy, a busy server) the backlog
-        # made the page stall and reconnect — the "refresh" that cut off
-        # the mic stream.
+        # ── Polling timers (reliable Gradio method) ───────────────────────────
+        gr.Timer(0.05).tick(
+            update_display,
+            inputs=[slug_state],
+            outputs=[display_html, recognized_output, translated_output],
+        )
+        gr.Timer(1.0).tick(update_logs, inputs=[slug_state], outputs=[log_output])
 
         interface.unload(cleanup_user_data)
 
