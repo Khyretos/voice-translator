@@ -41,7 +41,11 @@ from recognizers import (
 from vad import FastVAD, _WRTCVAD_AVAILABLE
 from live_whisper import LiveWhisperWorker
 from audio_input import open_input_stream
-from subtitles import SubtitleManager
+from discord_pipeline import DiscordPipeline
+from discord_source import bridge_available as discord_bridge_available
+from discord_source import check_bot as check_discord
+from discord_source import invite_url as discord_invite_url
+from subtitles import SpeakerBoard, SubtitleManager
 from session import (
     SessionSlugMiddleware,
     get_slug,
@@ -900,6 +904,13 @@ class VoiceTranslatorApp:
         "whisper_low_latency": True,  # greedy decoding (beam 1 / best-of 1)
         "whisper_interim": True,  # live partial captions while still speaking
         "whisper_max_segment_s": 6.0,  # cut continuous speech into pieces this long
+        # Discord voice channel source (see DISCORD.md)
+        "discord_bot_token": "",  # blank = use the DISCORD_BOT_TOKEN env var
+        "discord_user_id": "",  # the user whose voice channel the bot follows
+        "discord_ignore_ids": "",  # user ids never transcribed (e.g. your own)
+        "discord_avatar_side": "left",  # left | right
+        "discord_show_names": True,
+        "discord_max_speakers": 4,
     }
 
     def __init__(self, slug: str):
@@ -984,6 +995,13 @@ class VoiceTranslatorApp:
             fade_timeout=self.settings["fade_timeout"],
         )
 
+        # One caption row per speaker (Discord source)
+        self.speaker_board = SpeakerBoard(
+            fade_timeout=self.settings["fade_timeout"],
+            max_speakers=self.settings.get("discord_max_speakers", 4),
+        )
+        self.discord: DiscordPipeline | None = None
+
         if ARGOS_AVAILABLE:
             self.argos_translator = ArgosTranslator(logger=self.logger)
 
@@ -1051,16 +1069,27 @@ class VoiceTranslatorApp:
     # ── Dynamic settings helpers ──────────────────────────────────────────────
     def apply_vad_settings(self):
         """Push latest threshold + end_silence + noise filter into the running VAD."""
+        discord = self.discord
+        if discord is not None:
+            for sp in list(discord.speakers.values()):
+                if sp.vad is not None:
+                    self._apply_vad(sp.vad)
         if self.vad:
-            self.vad.update_threshold(self.settings.get("vad_threshold", -30.0))
-            self.vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 300))
-            self.vad.update_max_segment_ms(self._max_segment_ms())
-            self.vad.update_min_speech_ms(self.settings.get("vad_min_speech_ms", 200))
-            thresh = self.settings.get("noise_filter_threshold", 0.0)
-            self.vad.update_noise_filter_threshold(thresh)
+            self._apply_vad(self.vad)
+
+    def _apply_vad(self, vad: FastVAD):
+        vad.update_threshold(self.settings.get("vad_threshold", -30.0))
+        vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 300))
+        vad.update_max_segment_ms(self._max_segment_ms())
+        vad.update_min_speech_ms(self.settings.get("vad_min_speech_ms", 200))
+        vad.update_noise_filter_threshold(self.settings.get("noise_filter_threshold", 0.0))
 
     def apply_subtitle_settings(self):
         """Push latest subtitle settings into SubtitleManager."""
+        self.speaker_board.update_settings(
+            fade_timeout=self.settings.get("fade_timeout", 5.0),
+            max_speakers=self.settings.get("discord_max_speakers", 4),
+        )
         self.subtitles.update_settings(
             mode=self.settings.get("subtitle_mode", "instant"),
             cps=self.settings.get("subtitle_cps", 21),
@@ -1205,15 +1234,18 @@ class VoiceTranslatorApp:
         except (TypeError, ValueError):
             return 6000
 
+    def make_vad(self) -> FastVAD:
+        return FastVAD(
+            threshold_db=self.settings.get("vad_threshold", -30.0),
+            end_silence_ms=self.settings.get("vad_end_silence_ms", 300),
+            noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
+            max_segment_ms=self._max_segment_ms(),
+            min_speech_ms=self.settings.get("vad_min_speech_ms", 200),
+        )
+
     def _get_or_create_vad(self) -> FastVAD:
         if self.vad is None:
-            self.vad = FastVAD(
-                threshold_db=self.settings.get("vad_threshold", -30.0),
-                end_silence_ms=self.settings.get("vad_end_silence_ms", 300),
-                noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
-                max_segment_ms=self._max_segment_ms(),
-                min_speech_ms=self.settings.get("vad_min_speech_ms", 200),
-            )
+            self.vad = self.make_vad()
         return self.vad
 
     def _process_vosk(self, data: bytes):
@@ -1276,17 +1308,27 @@ class VoiceTranslatorApp:
                 level="debug",
             )
 
-        # Live partial captions for the utterance still in progress — only
-        # while the worker is otherwise idle, so they never delay a final.
+        if self.settings.get("whisper_interim", True):
+            self._last_interim_at = self.maybe_submit_interim(
+                vad, worker, self._last_interim_at
+            )
+
+    @staticmethod
+    def maybe_submit_interim(vad: FastVAD, worker: LiveWhisperWorker, last_at: float) -> float:
+        """
+        Live partial caption for the utterance still in progress — only while
+        the worker is otherwise idle, so it never delays a final. Returns the
+        (possibly updated) time of the last interim request.
+        """
         if (
-            self.settings.get("whisper_interim", True)
-            and vad.in_speech
+            vad.in_speech
             and vad.current_segment_ms() >= _INTERIM_MIN_AUDIO_MS
-            and time.monotonic() - self._last_interim_at >= _INTERIM_INTERVAL_S
+            and time.monotonic() - last_at >= _INTERIM_INTERVAL_S
             and worker.idle
+            and worker.submit_interim(vad.current_segment())
         ):
-            if worker.submit_interim(vad.current_segment()):
-                self._last_interim_at = time.monotonic()
+            return time.monotonic()
+        return last_at
 
     def _apply_noise_filter(self, data: bytes) -> bytes:
         """Legacy shim — delegates to VAD's integrated preprocessor."""
@@ -1314,15 +1356,26 @@ class VoiceTranslatorApp:
             timeout=10 if interim else 30,
         )
 
-    def _whisper_final(self, text: str, audio: bytes):
+    def _whisper_final(self, text: str, audio: bytes, speaker: str | None = None):
         text = self._clean_whisper_text(text)
         if text:
-            self.result_queue.put(("final", text, audio))
+            self.result_queue.put(("final", text, audio, speaker))
 
-    def _whisper_interim(self, text: str):
+    def _whisper_interim(self, text: str, speaker: str | None = None):
         text = self._clean_whisper_text(text)
         if text and self.is_running:
-            self.result_queue.put(("interim", text))
+            self.result_queue.put(("interim", text, None, speaker))
+
+    def vosk_feed(self, recognizer, pcm: bytes, speaker: str):
+        """Feed one Discord speaker's audio to their own Vosk recognizer."""
+        if recognizer.AcceptWaveform(pcm):
+            text = json.loads(recognizer.Result()).get("text", "").strip()
+            if text:
+                self.result_queue.put(("final", text, pcm, speaker))
+        elif self.settings.get("display_interim"):
+            partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
+            if partial:
+                self.result_queue.put(("interim", partial, None, speaker))
 
     def _drop_audio_backlog(self):
         """
@@ -1330,11 +1383,13 @@ class VoiceTranslatorApp:
         (e.g. a slow CPU running Vosk): rather than working through an
         ever-growing queue of old audio, drop the oldest blocks.
         """
+        # Discord: one 20 ms block per speaker, so allow proportionally more.
+        scale = self.discord.active_speakers if self.discord is not None else 1
         backlog = self.audio_queue.qsize()
-        if backlog <= _AUDIO_BACKLOG_MAX_BLOCKS:
+        if backlog <= _AUDIO_BACKLOG_MAX_BLOCKS * scale:
             return
         dropped = 0
-        while self.audio_queue.qsize() > _AUDIO_BACKLOG_KEEP_BLOCKS:
+        while self.audio_queue.qsize() > _AUDIO_BACKLOG_KEEP_BLOCKS * scale:
             try:
                 self.audio_queue.get_nowait()
                 dropped += 1
@@ -1352,9 +1407,16 @@ class VoiceTranslatorApp:
     def process_audio_hardware(self):
         while self.is_running:
             try:
+                discord = self.discord
+                if discord is not None:
+                    discord.tick()
                 self._drop_audio_backlog()
                 # Timeout matches blocksize (30ms) so we never wait longer than one block
                 data = self.audio_queue.get(timeout=0.03)
+                if isinstance(data, tuple):  # ("discord", user id, pcm)
+                    if discord is not None:
+                        discord.process(data[1], data[2])
+                    continue
                 engine = self.settings["recognition_engine"]
                 if engine == "vosk":
                     self._process_vosk(data)
@@ -1366,6 +1428,42 @@ class VoiceTranslatorApp:
                 self.logger.log(f"Audio processing error: {exc}", level="error")
 
     # ── Recognition control ───────────────────────────────────────────────────
+    def make_whisper_recognizer(self) -> WhisperRecognizer:
+        """
+        A Whisper client for the current settings. Low-latency mode means
+        greedy decoding: beam search (beam 5 / best-of 5) is several times
+        slower per request on most servers for a small accuracy gain — the
+        wrong trade for live captions. Each Discord speaker gets its own
+        client (and so its own HTTP connection).
+        """
+        low_latency = bool(self.settings.get("whisper_low_latency", True))
+        return WhisperRecognizer(
+            host=self.settings["whisper_host"],
+            api_key=self.settings.get("whisper_api_key") or None,
+            model=self.settings["whisper_model"],
+            logger=self.logger,
+            temperature=self.settings["whisper_temperature"],
+            best_of=1 if low_latency else self.settings["whisper_best_of"],
+            beam_size=1 if low_latency else self.settings["whisper_beam_size"],
+            patience=self.settings["whisper_patience"],
+            length_penalty=self.settings["whisper_length_penalty"],
+            suppress_tokens=self.settings["whisper_suppress_tokens"],
+            initial_prompt=self.settings["whisper_initial_prompt"] or None,
+            condition_on_previous_text=self.settings[
+                "whisper_condition_on_previous_text"
+            ],
+            temperature_increment_on_fallback=self.settings[
+                "whisper_temperature_increment_on_fallback"
+            ],
+            no_speech_threshold=self.settings["whisper_no_speech_threshold"],
+            logprob_threshold=self.settings["whisper_logprob_threshold"],
+            compression_ratio_threshold=self.settings[
+                "whisper_compression_ratio_threshold"
+            ],
+            endpoint_url=self.settings.get("whisper_endpoint_url"),
+            response_text_path=self.settings.get("whisper_response_text_path"),
+        )
+
     def start_recognition(self, model_path: str | None, microphone_index=None) -> str:
         # Non-blocking: a rapid double-click on Start should be rejected
         # immediately rather than queue up and fire a second start while the
@@ -1392,6 +1490,10 @@ class VoiceTranslatorApp:
             self.recognizer = None
 
             engine = self.settings["recognition_engine"]
+            if self.settings.get("audio_mode") == "discord" and engine == "moonshine":
+                msg = "❌ The Discord source works with Whisper or Vosk, not Moonshine"
+                self.logger.log(msg, level="error")
+                return msg
 
             if engine == "vosk":
                 if not model_path or not Path(model_path).exists():
@@ -1406,37 +1508,8 @@ class VoiceTranslatorApp:
                 self.moonshine_recognizer = None
 
             elif engine == "whisper":
-                # Low-latency mode: greedy decoding. Beam search (beam 5 /
-                # best-of 5) is several times slower per request on most
-                # servers for a small accuracy gain — the wrong trade for
-                # live captions.
                 low_latency = bool(self.settings.get("whisper_low_latency", True))
-                self.whisper_recognizer = WhisperRecognizer(
-                    host=self.settings["whisper_host"],
-                    api_key=self.settings.get("whisper_api_key") or None,
-                    model=self.settings["whisper_model"],
-                    logger=self.logger,
-                    temperature=self.settings["whisper_temperature"],
-                    best_of=1 if low_latency else self.settings["whisper_best_of"],
-                    beam_size=1 if low_latency else self.settings["whisper_beam_size"],
-                    patience=self.settings["whisper_patience"],
-                    length_penalty=self.settings["whisper_length_penalty"],
-                    suppress_tokens=self.settings["whisper_suppress_tokens"],
-                    initial_prompt=self.settings["whisper_initial_prompt"] or None,
-                    condition_on_previous_text=self.settings[
-                        "whisper_condition_on_previous_text"
-                    ],
-                    temperature_increment_on_fallback=self.settings[
-                        "whisper_temperature_increment_on_fallback"
-                    ],
-                    no_speech_threshold=self.settings["whisper_no_speech_threshold"],
-                    logprob_threshold=self.settings["whisper_logprob_threshold"],
-                    compression_ratio_threshold=self.settings[
-                        "whisper_compression_ratio_threshold"
-                    ],
-                    endpoint_url=self.settings.get("whisper_endpoint_url"),
-                    response_text_path=self.settings.get("whisper_response_text_path"),
-                )
+                self.whisper_recognizer = self.make_whisper_recognizer()
                 rec = self.whisper_recognizer
                 self.whisper_worker = LiveWhisperWorker(
                     transcribe_fn=lambda audio, interim: self._whisper_transcribe(
@@ -1483,6 +1556,7 @@ class VoiceTranslatorApp:
 
             # Reset subtitle buffer for new session
             self.subtitles.clear()
+            self.speaker_board.clear()
 
             # Start from live audio only — never from anything queued before.
             self._drain(self.audio_queue)
@@ -1498,7 +1572,23 @@ class VoiceTranslatorApp:
             self.is_running = True
             self.state_seq += 1
 
-            if (
+            if self.settings["audio_mode"] == "discord":
+                # The bot joins your voice channel; each speaker's audio
+                # arrives separately (discord_pipeline.py). Blocks until the
+                # bot has joined, or reports why it couldn't.
+                self.discord = DiscordPipeline(self)
+                self.process_thread = threading.Thread(
+                    target=self.process_audio_hardware, daemon=True
+                )
+                self.process_thread.start()
+                ok, msg = self.discord.start(
+                    fake_wav=os.environ.get("VT_DISCORD_FAKE_WAV") or None
+                )
+                if not ok:
+                    self.logger.log(msg, level="error")
+                    self.stop_recognition(reason=msg)
+                    return msg
+            elif (
                 self.settings["audio_mode"] == "hardware"
                 and microphone_index is not None
             ):
@@ -1517,10 +1607,11 @@ class VoiceTranslatorApp:
             else:
                 msg = "✅ Recognition started (Browser)"
 
-            self.process_thread = threading.Thread(
-                target=self.process_audio_hardware, daemon=True
-            )
-            self.process_thread.start()
+            if self.discord is None:
+                self.process_thread = threading.Thread(
+                    target=self.process_audio_hardware, daemon=True
+                )
+                self.process_thread.start()
 
             if self.settings.get("translation_mode") == "ai":
                 self.translation_service = TranslationService(
@@ -1576,7 +1667,13 @@ class VoiceTranslatorApp:
             return
         now = time.time()
         reason = None
-        if self.settings.get("audio_mode") == "hardware":
+        if self.settings.get("audio_mode") == "discord":
+            # Silence is normal here (Discord only sends audio while someone
+            # talks); what matters is that the bridge is still connected.
+            # Leaving the channel / disconnects are reported by the bridge.
+            if self.discord is not None and not self.discord.alive:
+                reason = "🔌 Discord connection lost — session stopped"
+        elif self.settings.get("audio_mode") == "hardware":
             stream = self.stream
             if stream is not None and not stream.active:
                 reason = "🔌 Audio device stopped (disconnected?) — session stopped"
@@ -1641,6 +1738,11 @@ class VoiceTranslatorApp:
             pt = getattr(self, "process_thread", None)
             if pt and pt.is_alive() and pt is not threading.current_thread():
                 pt.join(timeout=1.0)
+
+            # Discord: leave the voice channel, finish each speaker's last line.
+            if self.discord is not None:
+                discord, self.discord = self.discord, None
+                discord.stop()
 
             # Clear audio buffers
             self.vosk_audio_buffer.clear()
@@ -1711,8 +1813,21 @@ class VoiceTranslatorApp:
                 result_type, text = item[0], item[1]
                 if result_type == "stop":
                     break
+                speaker = item[3] if len(item) > 3 else None
+                if speaker is not None:
+                    # Discord: one caption row per speaker. Recognized text
+                    # shows immediately; the translation fills in later.
+                    if result_type == "final":
+                        self.speaker_board.add(speaker, text, "")
+                        if self.settings["enable_translation"]:
+                            self._translate_queue.put(
+                                (text, item[2], f"speaker:{speaker}")
+                            )
+                    elif result_type == "interim":
+                        self.speaker_board.set_interim(speaker, text)
+                    continue
                 if result_type == "final":
-                    audio = item[2] if len(item) > 2 else self.last_audio_chunk
+                    audio = (item[2] if len(item) > 2 else None) or self.last_audio_chunk
                     if not self.settings["enable_translation"]:
                         self.subtitles.add(text, "")
                     elif self.subtitles.mode == "instant":
@@ -1749,6 +1864,20 @@ class VoiceTranslatorApp:
             if item is None:
                 break
             text, audio, mode = item
+            if mode.startswith("speaker:"):
+                uid = mode.split(":", 1)[1]
+                # Skip lines this speaker has already replaced — with many
+                # people talking, a slow translator would otherwise fall
+                # further and further behind.
+                if not self.speaker_board.is_current(uid, text):
+                    continue
+                try:
+                    translated = self._translate(text, audio)
+                except Exception as exc:
+                    self.logger.log(f"Translation error: {exc}", level="error")
+                    translated = ""
+                self.speaker_board.set_translation(uid, text, translated)
+                continue
             if mode == "instant":
                 # Only the newest line is on screen in instant mode — if the
                 # translator fell behind, skip straight to the latest line
@@ -1918,7 +2047,74 @@ class VoiceTranslatorApp:
             + "</div></div>"
         )
 
+    def speaker_mode(self) -> bool:
+        return self.settings.get("audio_mode") == "discord"
+
+    def get_speaker_rows(self) -> list[dict]:
+        rows = self.speaker_board.get_display()
+        if not self.settings["enable_translation"]:
+            for r in rows:
+                r["tra"] = ""
+        return rows
+
+    def get_speaker_display_html(self, rows: list[dict]) -> str:
+        """In-app preview for the Discord source: one row per speaker."""
+        s = self.settings
+        halign = s.get("text_alignment", "center")
+        align_items = {"left": "flex-start", "center": "center", "right": "flex-end"}[halign]
+        valign = self._VERTICAL_MAP.get(s.get("vertical_alignment", "middle"), "center")
+        family = self._get_font_family_css()
+        rec_outline = self._get_outline_css(s.get("outline_width", 0), s.get("outline_color", "#000000"))
+        tra_outline = self._get_outline_css(
+            s.get("translated_outline_width", 0), s.get("translated_outline_color", "#000000")
+        )
+        avatar_px = max(24, int(s["recognized_font_size"] * 1.4))
+        direction = "row-reverse" if s.get("discord_avatar_side") == "right" else "row"
+        out = []
+        for r in rows:
+            name = (
+                f'<div style="font-size:{max(10, int(s["translated_font_size"] * 0.8))}px;'
+                f'color:{s["translated_color"]};opacity:.85;{tra_outline}">{html.escape(r["name"])}</div>'
+                if s.get("discord_show_names", True)
+                else ""
+            )
+            rec = (
+                f'<div style="font-size:{s["recognized_font_size"]}px;color:{s["recognized_color"]};'
+                f'{rec_outline}">{html.escape(r["rec"])}</div>'
+            )
+            tra = (
+                f'<div style="font-size:{s["translated_font_size"]}px;color:{s["translated_color"]};'
+                f'{tra_outline}">{html.escape(r["tra"])}</div>'
+                if r["tra"]
+                else ""
+            )
+            lines = tra + rec if s.get("translation_position") == "before" else rec + tra
+            avatar = (
+                f'<img src="{html.escape(r["avatar"])}" style="width:{avatar_px}px;height:{avatar_px}px;'
+                f'border-radius:50%;flex:none;object-fit:cover">'
+                if r["avatar"]
+                else f'<div style="width:{avatar_px}px;height:{avatar_px}px;border-radius:50%;'
+                f'flex:none;background:#5865F2"></div>'
+            )
+            out.append(
+                f'<div style="display:flex;flex-direction:{direction};align-items:center;gap:12px;'
+                f'margin:6px 0;text-align:{halign};font-family:{family};white-space:pre-wrap">'
+                f"{avatar}<div>{name}{lines}</div></div>"
+            )
+        return (
+            f"<style>{self._get_font_face_css()}</style>"
+            f'<div style="display:flex;flex-direction:column;justify-content:{valign};'
+            f'padding:20px;background-color:{s["background_color"]};min-height:200px;">'
+            f'<div class="vt-lines" style="transition:opacity 0.5s;opacity:1;display:flex;'
+            f'flex-direction:column;align-items:{align_items};">' + "".join(out) + "</div></div>"
+        )
+
     def get_current_display(self):
+        if self.speaker_mode():
+            rows = self.get_speaker_rows()
+            rec = "\n".join(f"{r['name']}: {r['rec']}" for r in rows)
+            trans = "\n".join(f"{r['name']}: {r['tra']}" for r in rows if r["tra"])
+            return self.get_speaker_display_html(rows), rec, trans
         rec, trans = self.subtitles.get_display()
         if not self.settings["enable_translation"]:
             trans = ""
@@ -2019,7 +2215,88 @@ class VoiceTranslatorApp:
         styling instead of needing a manual refresh."""
         return hashlib.md5(self.generate_popout_html().encode()).hexdigest()[:12]
 
+    def generate_speaker_popout_html(self) -> str:
+        """
+        Popout for the Discord source: one row per speaker (avatar, name,
+        caption, translation), stacked vertically. Rows appear and fade out
+        independently; a row keeps its text while fading and is removed only
+        once the fade has finished.
+        """
+        s = self.settings
+        halign = s.get("text_alignment", "center")
+        align_items = {"left": "flex-start", "center": "center", "right": "flex-end"}[halign]
+        valign = self._VERTICAL_MAP.get(s.get("vertical_alignment", "middle"), "center")
+        family = self._get_font_family_css()
+        rec_outline = self._get_outline_css(s.get("outline_width", 0), s.get("outline_color", "#000000"))
+        tra_outline = self._get_outline_css(
+            s.get("translated_outline_width", 0), s.get("translated_outline_color", "#000000")
+        )
+        avatar_px = max(24, int(s["recognized_font_size"] * 1.4))
+        direction = "row-reverse" if s.get("discord_avatar_side") == "right" else "row"
+        show_names = "true" if s.get("discord_show_names", True) else "false"
+        tra_first = "true" if s.get("translation_position") == "before" else "false"
+        return (
+            f'<!DOCTYPE html><html><head><title>Display</title><meta charset="UTF-8">'
+            f"<style>{self._get_font_face_css()}"
+            f"body,html{{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden;"
+            f"background:{s['background_color']};}}"
+            f"body{{display:flex;flex-direction:column;justify-content:{valign};}}"
+            f"#list{{box-sizing:border-box;width:100%;padding:20px;display:flex;"
+            f"flex-direction:column;align-items:{align_items}}}"
+            f".row{{display:flex;flex-direction:{direction};align-items:center;gap:14px;"
+            f"margin:8px 0;max-width:100%;transition:opacity 0.5s;opacity:1}}"
+            f".row.fade{{opacity:0}}"
+            f".avatar{{width:{avatar_px}px;height:{avatar_px}px;border-radius:50%;flex:none;"
+            f"object-fit:cover;background:#5865F2;color:#fff;display:flex;align-items:center;"
+            f"justify-content:center;font:bold {avatar_px // 2}px sans-serif}}"
+            f".body{{min-width:0;text-align:{halign};font-family:{family};white-space:pre-wrap}}"
+            f".body>div{{margin:2px 0}}.body>div:empty{{display:none}}"
+            f".name{{font-size:{max(10, int(s['translated_font_size'] * 0.8))}px;"
+            f"color:{s['translated_color']};opacity:.85;{tra_outline}}}"
+            f".rec{{font-size:{s['recognized_font_size']}px;color:{s['recognized_color']};{rec_outline}}}"
+            f".tra{{font-size:{s['translated_font_size']}px;color:{s['translated_color']};{tra_outline}}}"
+            f"</style>"
+            f"<script>"
+            f"const SHOW_NAMES={show_names},TRA_FIRST={tra_first};"
+            f"let key=null;const rows=new Map();"
+            f"function el(tag,cls){{const e=document.createElement(tag);e.className=cls;return e}}"
+            f"function setText(e,t){{if(e.textContent!==t)e.textContent=t}}"
+            f"function avatar(r){{let a;"
+            f'if(r.avatar){{a=el("img","avatar");a.src=r.avatar;a.alt=""}}'
+            f'else{{a=el("div","avatar");a.textContent=(r.name||"?").charAt(0).toUpperCase()}}'
+            f"return a}}"
+            f"function makeRow(r){{const row=el(\"div\",\"row fade\");row.dataset.id=r.id;"
+            f'const body=el("div","body");row._name=el("div","name");row._rec=el("div","rec");'
+            f'row._tra=el("div","tra");body.append(row._name);'
+            f"if(TRA_FIRST)body.append(row._tra,row._rec);else body.append(row._rec,row._tra);"
+            f"row._avatar=avatar(r);row._src=r.avatar;row.append(row._avatar,body);return row}}"
+            f"async function update(){{try{{"
+            f'const res=await fetch("/popout_data/{self.popout_id}",{{cache:"no-store"}});'
+            f"if(!res.ok)return;const d=await res.json();"
+            f"if(d.style_key){{if(key===null)key=d.style_key;"
+            f"else if(d.style_key!==key){{location.reload();return}}}}"
+            f'const list=document.getElementById("list"),seen=new Set();'
+            f"for(const r of (d.speakers||[])){{seen.add(r.id);let row=rows.get(r.id);"
+            f"if(!row){{row=makeRow(r);rows.set(r.id,row);list.append(row);"
+            f'requestAnimationFrame(()=>requestAnimationFrame(()=>row.classList.remove("fade")))}}'
+            f'else row.classList.remove("fade");'
+            f"if(r.avatar&&row._src!==r.avatar){{const a=avatar(r);row._avatar.replaceWith(a);"
+            f"row._avatar=a;row._src=r.avatar}}"
+            f'setText(row._name,SHOW_NAMES?(r.name||""):"");setText(row._rec,r.rec||"");'
+            f'setText(row._tra,r.tra||"")}}'
+            f'for(const [id,row] of rows)if(!seen.has(id))row.classList.add("fade")'
+            f"}}catch(e){{}}}}"
+            f'document.addEventListener("DOMContentLoaded",()=>{{'
+            f'document.getElementById("list").addEventListener("transitionend",e=>{{'
+            f'const row=e.target;if(row.classList&&row.classList.contains("row")&&'
+            f'row.classList.contains("fade")){{row.remove();rows.delete(row.dataset.id)}}}});'
+            f"update();setInterval(update,150)}});"
+            f"</script></head><body><div id=\"list\"></div></body></html>"
+        )
+
     def generate_popout_html(self) -> str:
+        if self.speaker_mode():
+            return self.generate_speaker_popout_html()
         halign = self.settings.get("text_alignment", "center")
         valign = self._VERTICAL_MAP.get(
             self.settings.get("vertical_alignment", "middle"), "center"
@@ -2580,6 +2857,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             ("Server Audio Device", "hardware"),
                             ("Browser Microphone", "browser_mic"),
                             ("Browser Tab / System Audio", "browser_display"),
+                            ("Discord Voice Channel", "discord"),
                         ],
                         value="hardware",
                         label="Audio Source",
@@ -2641,6 +2919,51 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             browser_stop_test_mic_btn = gr.Button(
                                 "⏹ Stop Test", size="sm", visible=False
                             )
+
+                    with gr.Group(visible=False) as discord_group:
+                        gr.Markdown(
+                            "**Discord** — a bot joins the voice channel you're in and "
+                            "captions everyone separately, with their avatar and name. "
+                            "Works with Whisper or Vosk. First-time setup: see "
+                            "DISCORD.md (create a bot, invite it to your server)."
+                        )
+                        discord_bot_token = gr.Textbox(
+                            label="Bot token",
+                            type="password",
+                            placeholder="Leave empty to use DISCORD_BOT_TOKEN from docker-compose",
+                        )
+                        discord_user_id = gr.Textbox(
+                            label="Your Discord user ID",
+                            placeholder="e.g. 123456789012345678",
+                            info="The bot follows this user: it joins whatever voice channel "
+                            "you're in (on servers it's been invited to), moves when you move, "
+                            "and the session stops when you leave. Discord → Settings → "
+                            "Advanced → Developer Mode, then right-click yourself → Copy User ID.",
+                        )
+                        discord_ignore_ids = gr.Textbox(
+                            label="Ignore these user IDs",
+                            placeholder="e.g. your own ID if another session already captions you",
+                            info="Never captioned. Separate with commas or spaces. "
+                            "Applies immediately, even while running.",
+                        )
+                        with gr.Row():
+                            discord_avatar_side = gr.Radio(
+                                [("Left", "left"), ("Right", "right")],
+                                value="left",
+                                label="Avatar side",
+                            )
+                            discord_show_names = gr.Checkbox(
+                                value=True, label="Show names"
+                            )
+                        discord_max_speakers = gr.Slider(
+                            1,
+                            10,
+                            4,
+                            step=1,
+                            label="Max speakers on screen",
+                            info="When more people talk at once, the most recent ones are shown.",
+                        )
+                        discord_check_btn = gr.Button("🔍 Check bot", size="sm")
 
                     # ── VAD + Level meter (always visible, works in test mode too) ──
                     with gr.Group():
@@ -3201,6 +3524,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 browser_group: gr.update(
                     visible=(mode in ("browser_mic", "browser_display"))
                 ),
+                discord_group: gr.update(visible=(mode == "discord")),
                 browser_source_hint: gr.update(value=hint),
             }
 
@@ -3276,6 +3600,39 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             app.popout_id = secrets.token_urlsafe(16)
             status = f"🎲 New random popout ID saved: {app.popout_id}"
             return _popout_url(request, app), app.popout_id, status
+
+        def update_discord_ignore(value, request: gr.Request):
+            app = get_or_create_app(get_slug(request))
+            app.settings["discord_ignore_ids"] = value
+            persist_settings(app.slug, app.settings)
+            if app.discord is not None:
+                app.discord.set_ignore(value)
+
+        def check_discord_bot(request: gr.Request):
+            app = get_or_create_app(get_slug(request))
+            problem = discord_bridge_available()
+            if problem:
+                return f"❌ Discord: {problem}"
+            token = (app.settings.get("discord_bot_token") or "").strip() or (
+                os.environ.get("DISCORD_BOT_TOKEN") or ""
+            ).strip()
+            if not token:
+                return "❌ Discord: set the bot token first"
+            res = check_discord(token, (app.settings.get("discord_user_id") or "").strip())
+            if res.get("type") != "check":
+                return f"❌ Discord: {res.get('message', 'check failed')}"
+            guilds = res.get("guilds") or []
+            lines = [f"✅ Logged in as {res.get('bot')} — in {len(guilds)} server(s)"]
+            if guilds:
+                lines.append("Servers: " + ", ".join(guilds[:10]) + (" …" if len(guilds) > 10 else ""))
+            else:
+                lines.append("⚠️ The bot isn't in any server yet — invite it:")
+            lines.append("Invite link: " + discord_invite_url(res.get("bot_id", "")))
+            if res.get("follow_channel"):
+                lines.append(f"🎧 You're in {res['follow_channel']} — ready to Start")
+            elif app.settings.get("discord_user_id"):
+                lines.append("You're not in a voice channel the bot can see right now")
+            return "\n".join(lines)
 
         def test_whisper_connection(request: gr.Request):
             app = get_or_create_app(get_slug(request))
@@ -3518,6 +3875,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_low_latency: s["whisper_low_latency"],
                 whisper_interim: s["whisper_interim"],
                 whisper_max_segment_s: s["whisper_max_segment_s"],
+                discord_bot_token: s["discord_bot_token"],
+                discord_user_id: s["discord_user_id"],
+                discord_ignore_ids: s["discord_ignore_ids"],
+                discord_avatar_side: s["discord_avatar_side"],
+                discord_show_names: s["discord_show_names"],
+                discord_max_speakers: s["discord_max_speakers"],
             }
 
         def reset_to_defaults(request: gr.Request):
@@ -3645,6 +4008,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_low_latency: s["whisper_low_latency"],
                 whisper_interim: s["whisper_interim"],
                 whisper_max_segment_s: s["whisper_max_segment_s"],
+                discord_bot_token: s["discord_bot_token"],
+                discord_user_id: s["discord_user_id"],
+                discord_ignore_ids: s["discord_ignore_ids"],
+                discord_avatar_side: s["discord_avatar_side"],
+                discord_show_names: s["discord_show_names"],
+                discord_max_speakers: s["discord_max_speakers"],
             }
 
         # ── Wire events ───────────────────────────────────────────────────────
@@ -3657,7 +4026,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         audio_mode.change(
             update_audio_mode,
             [audio_mode],
-            [hardware_group, browser_group, browser_source_hint],
+            [hardware_group, browser_group, discord_group, browser_source_hint],
         )
         translation_mode.change(
             update_translation_mode,
@@ -3864,6 +4233,15 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         audio_watchdog_seconds.change(
             _set("audio_watchdog_seconds"), [audio_watchdog_seconds]
         )
+        discord_bot_token.change(_set("discord_bot_token"), [discord_bot_token])
+        discord_user_id.change(_set("discord_user_id"), [discord_user_id])
+        discord_ignore_ids.change(update_discord_ignore, [discord_ignore_ids])
+        discord_avatar_side.change(_set("discord_avatar_side"), [discord_avatar_side])
+        discord_show_names.change(_set("discord_show_names"), [discord_show_names])
+        discord_max_speakers.change(
+            _set_subtitle("discord_max_speakers"), [discord_max_speakers]
+        )
+        discord_check_btn.click(check_discord_bot, outputs=[status_text])
         whisper_low_latency.change(_set("whisper_low_latency"), [whisper_low_latency])
         whisper_interim.change(_set("whisper_interim"), [whisper_interim])
         whisper_max_segment_s.change(
@@ -4080,6 +4458,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_low_latency,
                 whisper_interim,
                 whisper_max_segment_s,
+                discord_bot_token,
+                discord_user_id,
+                discord_ignore_ids,
+                discord_avatar_side,
+                discord_show_names,
+                discord_max_speakers,
             ],
         )
 
@@ -4220,6 +4604,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_low_latency,
                 whisper_interim,
                 whisper_max_segment_s,
+                discord_bot_token,
+                discord_user_id,
+                discord_ignore_ids,
+                discord_avatar_side,
+                discord_show_names,
+                discord_max_speakers,
             ],
         )
 
@@ -4425,6 +4815,7 @@ if __name__ == "__main__":
                 {
                     "recognized": rec,
                     "translated": trans if app.settings["enable_translation"] else "",
+                    "speakers": app.get_speaker_rows() if app.speaker_mode() else None,
                     "style_key": app.popout_style_key(),
                 }
             )

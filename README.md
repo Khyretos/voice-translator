@@ -20,6 +20,7 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
   - **Moonshine** – lightweight ONNX‑based local ASR. Auto‑downloads models from HuggingFace. Supports 8+ languages.
 - **Persistent, Named Sessions** – open `?session=<name>` (or `/<name>` behind a reverse-proxy rewrite) to get a session with its own settings that survives reloads, reconnects, and new tabs — it's freed only when you explicitly close it, never automatically. A plain visit with no name gives you the same stable `main` session every time. See [SESSIONS.md](./SESSIONS.md)
 - **Any Audio Source** – a server-side input device (including a virtual/loopback device routed from another app, e.g. Discord's desktop client), this device's browser microphone, or a shared browser tab/window/screen's audio (e.g. Discord in a browser tab, or Windows/ChromeOS system audio) — see [AUDIO_SOURCES.md](./AUDIO_SOURCES.md)
+- **Discord Voice Channel captions**: a bot joins your voice channel and captions every speaker separately, with their avatar and name, as stacked rows in the OBS popout. See [DISCORD.md](./DISCORD.md)
 - **Shared Model Loading** – two sessions using the *same* Vosk model share one copy in RAM instead of loading it twice
 - **Pop‑out Display** – separate window for OBS overlay, updates via polling
 - **Interim Results** – show partial recognition as you speak

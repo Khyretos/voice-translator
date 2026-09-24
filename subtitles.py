@@ -255,3 +255,116 @@ class SubtitleManager:
     def clear(self):
         with self._lock:
             self._clear_state()
+
+
+class SpeakerBoard:
+    """
+    Live captions for several speakers at once (Discord source): one line per
+    person, each with its own fade timer.
+
+    get_display() returns the speakers whose text is still within the fade
+    timeout, at most `max_speakers` of them (the most recently active),
+    listed in the order they started talking so rows don't jump around.
+    """
+
+    def __init__(self, fade_timeout: float = 5.0, max_speakers: int = 4):
+        self._lock = threading.Lock()
+        self.fade_timeout = max(0.5, fade_timeout)
+        self.max_speakers = max(1, max_speakers)
+        self._speakers: dict[str, dict] = {}
+        self._order = 0
+
+    def update_settings(self, fade_timeout=None, max_speakers=None):
+        with self._lock:
+            if fade_timeout is not None:
+                self.fade_timeout = max(0.5, float(fade_timeout))
+            if max_speakers is not None:
+                self.max_speakers = max(1, int(max_speakers))
+
+    def _get(self, uid: str) -> dict:
+        s = self._speakers.get(uid)
+        if s is None:
+            s = self._speakers[uid] = {
+                "id": uid,
+                "name": f"User {uid[-4:]}",
+                "avatar": "",
+                "rec": "",
+                "tra": "",
+                "final": "",
+                "updated": 0.0,
+                "since": 0.0,
+                "order": 0,
+            }
+        return s
+
+    def set_info(self, uid: str, name: str, avatar: str = ""):
+        with self._lock:
+            s = self._get(uid)
+            if name:
+                s["name"] = name
+            s["avatar"] = avatar or s["avatar"]
+
+    def _touch(self, s: dict, now: float):
+        if now - s["updated"] > self.fade_timeout:
+            # Faded out since last time: this is a new appearance, so it
+            # goes to the end of the on-screen order.
+            self._order += 1
+            s["order"] = self._order
+            s["since"] = now
+            s["tra"] = ""
+        s["updated"] = now
+
+    def set_interim(self, uid: str, text: str):
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._lock:
+            s = self._get(uid)
+            self._touch(s, time.time())
+            s["rec"] = text
+
+    def add(self, uid: str, recognized: str, translated: str = ""):
+        recognized = (recognized or "").strip()
+        if not recognized:
+            return
+        with self._lock:
+            s = self._get(uid)
+            self._touch(s, time.time())
+            s["rec"] = recognized
+            s["final"] = recognized
+            s["tra"] = (translated or "").strip()
+
+    def set_translation(self, uid: str, recognized: str, translated: str):
+        translated = (translated or "").strip()
+        if not translated:
+            return
+        with self._lock:
+            s = self._speakers.get(uid)
+            if s is None or s["final"] != (recognized or "").strip():
+                return  # superseded by a newer line from this speaker
+            s["tra"] = translated
+            s["updated"] = time.time()
+
+    def is_current(self, uid: str, recognized: str) -> bool:
+        with self._lock:
+            s = self._speakers.get(uid)
+            return s is not None and s["final"] == (recognized or "").strip()
+
+    def get_display(self) -> list[dict]:
+        now = time.time()
+        with self._lock:
+            active = [
+                s for s in self._speakers.values()
+                if s["rec"] and now - s["updated"] <= self.fade_timeout
+            ]
+            active.sort(key=lambda s: s["updated"], reverse=True)
+            active = active[: self.max_speakers]
+            active.sort(key=lambda s: s["order"])
+            return [
+                {k: s[k] for k in ("id", "name", "avatar", "rec", "tra")}
+                for s in active
+            ]
+
+    def clear(self):
+        with self._lock:
+            self._speakers.clear()

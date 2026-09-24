@@ -101,6 +101,13 @@ PERSISTABLE_KEYS = [
     # Popout/OBS URL id — persisted so an OBS browser source keeps working
     # across restarts and after changing it.
     "popout_id",
+    # Discord voice channel source (see DISCORD.md)
+    "discord_bot_token",
+    "discord_user_id",
+    "discord_ignore_ids",
+    "discord_avatar_side",
+    "discord_show_names",
+    "discord_max_speakers",
 ]
 
 # Keys that identify one specific session and must never be copied into a
