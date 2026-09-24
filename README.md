@@ -19,10 +19,13 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
   - **Internal translation** – using `translators` library (Google Translate, etc.)
   - **Moonshine** – lightweight ONNX‑based local ASR. Auto‑downloads models from HuggingFace. Supports 8+ languages.
 - **Persistent, Named Sessions** – open `?session=<name>` (or `/<name>` behind a reverse-proxy rewrite) to get a session with its own settings that survives reloads, reconnects, and new tabs — it's freed only when you explicitly close it, never automatically. A plain visit with no name gives you the same stable `main` session every time. See [SESSIONS.md](./SESSIONS.md)
+- **Self-healing audio** – browser audio is captured on its own audio thread and reconnects by itself after a network blip; after a page reload a running browser-mic session re-attaches the mic automatically
+- **Auto-stop when the audio source is lost** – an unplugged mic or server device, a stopped tab share, or a closed tab stops recognition instead of leaving it "running" with no audio (configurable, 0 = off)
 - **Any Audio Source** – a server-side input device (including a virtual/loopback device routed from another app, e.g. Discord's desktop client), this device's browser microphone, or a shared browser tab/window/screen's audio (e.g. Discord in a browser tab, or Windows/ChromeOS system audio) — see [AUDIO_SOURCES.md](./AUDIO_SOURCES.md)
-- **Discord Voice Channel captions**: a bot joins your voice channel and captions every speaker separately, with their avatar and name, as stacked rows in the OBS popout. See [DISCORD.md](./DISCORD.md)
+- **Discord Voice Channel captions** – a bot joins your voice channel and captions (and translates) every speaker separately, with their avatar and name, as stacked rows in the OBS popout. See [DISCORD.md](./DISCORD.md)
+- **Live Whisper captions** – text appears while you're still talking (long speech is sent in pieces, plus live partial captions), requests never pile up behind a slow server, and greedy low-latency decoding is on by default — see [RECOGNITION_QUALITY.md](./RECOGNITION_QUALITY.md)
 - **Shared Model Loading** – two sessions using the *same* Vosk model share one copy in RAM instead of loading it twice
-- **Pop‑out Display** – separate window for OBS overlay, updates via polling
+- **Pop‑out Display** – separate window for OBS overlay; its ID is saved per session so the OBS URL survives restarts, and it restyles itself when you change display settings
 - **Interim Results** – show partial recognition as you speak
 - **Multi‑language Support** – recognize and translate between many languages
 
@@ -30,6 +33,7 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 
 - **Font, Size, Color** – fully customizable for both recognized and translated text
 - **Text Alignment** – left, center, or right
+- **Vertical Position** – top, middle, or bottom (bottom + a stream-sized popout = classic subtitles)
 - **Translation Position** – before or after the recognized text
 - **Background Color** – set any color (use `#00FF00` for chroma key)
 - **Fade Timeout** – automatically fade text after a configurable pause
@@ -41,6 +45,8 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 - **Vosk Model Management** – load models from local `vosk_models/` directory
 - **Argos Model Management** – download and install offline translation models with `download_argos_model.py`
 - **Whisper API Integration** – use any OpenAI‑compatible Whisper server (e.g., `whisper.cpp`, `faster-whisper`); confidence thresholds (no-speech, log-prob, compression-ratio) are enforced client-side against the actual response, not just sent as unverified request params
+- **Hallucination guard** – desk knocks, clicks and coughs never reach Whisper (only sounds with enough actual speech are sent), and known "Thank you" / "Subscribe" / subtitle-credit outputs are filtered in several languages
+- **Any input device sample rate** – server devices that can't record at 16 kHz are opened at their native rate and resampled
 - **Docker Support** – easy deployment with Docker/Docker Compose
 - **Comprehensive Logging** – real‑time logs in UI and persistent file logs
 - **Crash-safe start/stop** – starting and stopping recognition (including double-clicks and fast start-then-stop) is serialized so it can't race and crash the process
@@ -101,6 +107,19 @@ A powerful, OBS-compatible voice recognition and translation app built with Pyth
 
 ![alt text](./images/image-8.png)
 
+### Discord Voice Channel
+
+<!-- Placeholder: add the screenshots as images/discord-settings.png and
+     images/discord-popout.png and they'll show up here. -->
+
+#### Settings
+
+![Discord settings panel](./images/discord-settings.png)
+
+#### Per-speaker captions in the OBS popout
+
+![Discord speakers in the popout](./images/discord-popout.png)
+
 ## 📋 Requirements
 
 ### System Requirements
@@ -154,9 +173,9 @@ See `requirements.txt` for the full, current list (gradio, vosk, sounddevice, mo
    Use the included `download_vosk_models.py` script:
 
    ```bash
-   python download_vosk_models.py en-us-small # light English model
-   python download_vosk_models.py en-us # full English model
-   python download_vosk_models.py es fr de # multiple languages
+   python download_vosk_models.py --list --lang en-us        # see what's available
+   python download_vosk_models.py --lang en-us --small       # current small English model
+   python download_vosk_models.py vosk-model-small-es-0.42   # an exact model by name
    ```
 
    Models are placed in the `vosk_models/` directory.
@@ -202,7 +221,9 @@ See `requirements.txt` for the full, current list (gradio, vosk, sounddevice, mo
 - **Audio access** on Linux requires the `--device /dev/snd` flag (already in `docker-compose.yml`). On macOS/Windows, Docker Desktop may have limited audio support; use browser audio mode instead.
 - **Moonshine (local ONNX model)** is included in `requirements.txt` by default now.
 - **Volume mounts** – the compose file mounts `./vosk_models`, `./argos_models`, `./moonshine_models`, `./fonts`, `./logs`, and **`./settings`** (this last one is important — it's where every named session's settings actually live; without it, all settings are lost on every container restart). Create these directories on your host before starting the container, or let Compose create them automatically.
-- **Sessions are permanent by default** — nothing auto-closes a session that's actively listening, no matter how long it runs or how much silence there is. `IDLE_SESSION_TIMEOUT_SECONDS` in `docker-compose.yml` is opt-in (off by default, `0`) and even when set only ever considers *stopped* sessions left idle, never a running one. See [SESSIONS.md](./SESSIONS.md).
+- **Sessions are permanent by default** — silence never stops a session, however long it lasts. Recognition only stops by itself when the audio source is actually gone (see *Auto-stop when audio is lost* in the Audio settings). `IDLE_SESSION_TIMEOUT_SECONDS` in `docker-compose.yml` is opt-in (off by default, `0`) and even when set only ever considers *stopped* sessions left idle, never a running one. See [SESSIONS.md](./SESSIONS.md).
+- **Discord support** — the image also contains Node.js and the Discord bridge's packages (a separate build stage). A bot token can go in `DISCORD_BOT_TOKEN`, or per session in the UI. See [DISCORD.md](./DISCORD.md).
+- **Updating** — copy the files over as-is (all `.py` files plus the `discord_bridge/` folder without `node_modules`) and rebuild with `docker compose up -d --build`; the Python files are baked into the image, so a restart alone doesn't pick them up.
 
 ### `docker-compose.yml`
 
@@ -226,6 +247,7 @@ services:
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7860
       # - IDLE_SESSION_TIMEOUT_SECONDS=21600  # opt-in; 0/unset = never auto-close
+      # - DISCORD_BOT_TOKEN=                   # optional; see DISCORD.md
     restart: unless-stopped
 ```
 
@@ -242,6 +264,7 @@ services:
    - **Server Audio Device** – any input device the server can see, including a virtual/loopback device if you route another app's output through one (see [AUDIO_SOURCES.md](./AUDIO_SOURCES.md))
    - **Browser Microphone** – this device's mic, streamed over the network
    - **Browser Tab / System Audio** – share a browser tab, window, or screen with "share audio" checked (e.g. a Discord web tab, or Windows/ChromeOS system audio)
+   - **Discord Voice Channel** – a bot joins the voice channel you're in and captions each speaker separately (see [🎧 Discord](#-discord-voice-channel) below)
 
 3. **Configure Translation** (optional):
    - **Argos** – offline translation using downloaded Argos models
@@ -299,6 +322,8 @@ Adjust when the app detects speech:
 
 - **Threshold (dB)** – sensitivity. Lower values (‑60) detect whispers, higher (‑10) only loud speech.
 - **End‑of‑speech pause** – how long silence waits before sending a segment to Whisper/Moonshine (Vosk has its own internal endpointer and isn't affected by this). Default is 300 ms — short pauses (breathing, thinking) shorter than this get fragmented into tiny clips, which is exactly what triggers Whisper to hallucinate filler text like "thank you". Raise further (500–800 ms) if phrases still get cut off; lower it if replies feel laggy.
+- **Ignore sounds shorter than** – Whisper only: a sound needs at least this much actual speech (default 200 ms) to be sent, so knocks and clicks don't turn into "Thank you". Lower it if very short replies get dropped.
+- **Auto-stop when audio is lost** – stop recognition when the source disappears (default 8 s; 0 = never).
 - **Noise filter** – removes clicks, keyboard, and background hum. 0 = off, 1 = aggressive (may soften speech).
 
 ### 📺 Subtitle Display Modes
@@ -331,7 +356,7 @@ Full details, including how to get pretty `/<name>` URLs via an nginx rewrite, i
 
 ### 🔗 Pop‑out Custom ID
 
-By default, the pop‑out URL uses a random ID. You can enter a custom ID (letters, numbers, underscores, hyphens) to get a persistent URL, e.g., `http://localhost:7860/popout/my_stream`.
+Each session gets a random pop‑out ID the first time it's created. Enter a custom ID (letters, numbers, underscores, hyphens) and press Enter or click away to use a readable URL, e.g., `http://localhost:7860/popout/my_stream`. The ID is saved with the session, so the OBS URL keeps working after restarts, and each ID can only belong to one session.
 
 ### 🐳 Docker Audio Passthrough
 
@@ -342,12 +367,30 @@ By default, the pop‑out URL uses a random ID. You can enter a custom ID (lette
 
 Expand the **Advanced Whisper Parameters** accordion to fine‑tune transcription (temperature, beam size, no‑speech threshold, etc.). These thresholds are now actually enforced against the response, not just sent as request params — see [RECOGNITION_QUALITY.md](./RECOGNITION_QUALITY.md). See the [OpenAI Whisper API docs](https://platform.openai.com/docs/api-reference/audio/createTranscription) for what each parameter does.
 
+### ⚡ Whisper Live Mode
+
+In the Whisper settings, **Live mode** keeps captions close to real time:
+**Low-latency decoding** (greedy, overrides beam size / best-of),
+**Live partial captions** (the sentence so far, refreshed while you speak), and
+**Max segment length** (long speech is sent in pieces, default 6 s). See
+[RECOGNITION_QUALITY.md](./RECOGNITION_QUALITY.md).
+
+### 🎧 Discord Voice Channel
+
+Pick **Discord Voice Channel** as the audio source, enter a bot token and your
+Discord user ID, and press Start while you're in a voice channel. The bot
+joins, follows you between channels, and each speaker gets their own caption
+row (avatar left or right, optional names, max rows on screen). Use **Check
+bot** to verify the token and get an invite link, and **Ignore these user IDs**
+for people who shouldn't be captioned. Works with Whisper and Vosk. Setup and
+limits: [DISCORD.md](./DISCORD.md).
+
 ### Display Customization
 
 Open the **Display Style** accordion to adjust:
 
 - Font family, sizes, colors
-- Text alignment
+- Text alignment (left/center/right) and vertical position (top/middle/bottom)
 - Translation position (before/after)
 - Fade timeout
 
@@ -356,8 +399,10 @@ Open the **Display Style** accordion to adjust:
 1. Start the app.
 2. Copy the **Popout URL** from the UI (e.g., `http://localhost:7860/popout/abc123`).
 3. In OBS, add a **Browser Source** and paste the URL.
-4. Set desired width/height (e.g., 1920×200).
+4. Set desired width/height — e.g. 1920×200 for a caption bar, or 1920×1080 with **Vertical position: Bottom** for subtitles over the whole stream.
 5. Optionally add custom CSS to remove background.
+
+Changing display settings in the app updates an open popout by itself — no need to refresh the browser source.
 
 ## 📁 Project Structure
 
@@ -369,6 +414,11 @@ voice-translator/
 ├── vad.py                  # FastVAD — voice activity detection + preprocessing
 ├── subtitles.py            # SubtitleManager — subtitle buffering/pacing
 ├── recognizers.py          # ArgosTranslator, WhisperRecognizer, MoonshineRecognizer, hallucination filtering
+├── live_whisper.py         # LiveWhisperWorker — ordered, non-backlogging Whisper requests + interim captions
+├── audio_input.py          # Server input devices at any sample rate, resampled to 16 kHz
+├── discord_source.py       # Starts/talks to the Discord bridge process
+├── discord_pipeline.py     # Per-speaker VAD + recognition for the Discord source
+├── discord_bridge/         # Node.js Discord bot (bridge.js) that receives each speaker's audio
 ├── translators.py          # TranslationService — AI / LibreTranslate / Argos dispatch
 ├── logger.py                # Logging module
 ├── requirements.txt        # Python dependencies
@@ -382,7 +432,8 @@ voice-translator/
 ├── QUICKSTART.md            # Quick start guide
 ├── TROUBLESHOOTING.md       # Troubleshooting guide
 ├── SESSIONS.md               # Named/persistent session design + nginx pretty-URL setup
-├── AUDIO_SOURCES.md          # The three audio source options, and routing another app's audio in
+├── AUDIO_SOURCES.md          # The audio source options, and routing another app's audio in
+├── DISCORD.md                # Discord voice channel captions: setup, usage, limits
 ├── AI_TRANSLATION.md         # Editable AI prompt/endpoint/request/response shape
 ├── RECOGNITION_QUALITY.md    # VAD tuning + the Whisper hallucination fixes
 ├── REFACTOR.md               # Why the code is split the way it is, and how it's tested
@@ -404,10 +455,13 @@ pytest
 ```
 
 A pytest suite covers `session.py`, `settings_store.py`, `vad.py`,
-`subtitles.py`, `recognizers.py`, and `translators.py` — session-slug
-resolution, per-session settings persistence, VAD segmentation, subtitle
-timing/pacing, hallucination filtering, and the editable AI prompt/endpoint
-logic. Runs in a few seconds with no vosk models, audio hardware, or
+`subtitles.py`, `recognizers.py`, `translators.py`, `live_whisper.py`,
+`audio_input.py` and the Discord bridge — session-slug resolution,
+per-session settings persistence, VAD segmentation and knock rejection,
+subtitle timing/pacing, per-speaker captions, hallucination filtering,
+Whisper request ordering, resampling, and the editable AI prompt/endpoint
+logic. The Discord bridge test runs the real Node process in its
+fake-speaker mode and is skipped if Node isn't installed. Runs in a few seconds with no vosk models, audio hardware, or
 running Gradio server required. See [REFACTOR.md](./REFACTOR.md) for what's
 covered and why `voice_translator.py` itself (the Gradio UI + FastAPI
 routes) isn't part of the automated suite.
