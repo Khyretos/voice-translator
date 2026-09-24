@@ -153,7 +153,8 @@
 # NETWORK SHARING
 # ============================================
 # To share on local network:
-#   python app.py --host 0.0.0.0 --session my-event
+#   python voice_translator.py --host 0.0.0.0
+#   (named session: http://YOUR_IP:7860/?session=my-event)
 #
 # Access from other devices:
 #   http://YOUR_IP:7860

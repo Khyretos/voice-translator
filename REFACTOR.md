@@ -45,11 +45,24 @@ step against — happy to help with that next.
 
 ## ⚠️ If you deploy via Docker
 
-`Dockerfile`'s `COPY` line now lists all seven files
-(`voice_translator.py translators.py logger.py session.py settings_store.py
-vad.py subtitles.py recognizers.py`) — it used to list only three. If
-you've made local Dockerfile edits since receiving this, make sure the new
-modules are included or the container will fail on import at startup.
+`Dockerfile` copies every top-level `.py` file (`COPY *.py ./`) rather than
+listing them, so a newly added module can't be forgotten (that exact mistake
+once broke startup with `No module named 'live_whisper'`). The Discord
+bridge (`discord_bridge/`) is installed in its own Node build stage. When
+updating a Docker install, copy the files over as-is and rebuild with
+`docker compose up -d --build`.
+
+### Modules added later
+
+```text
+live_whisper.py      LiveWhisperWorker — ordered, non-backlogging Whisper
+                     requests + interim captions (RECOGNITION_QUALITY.md)
+audio_input.py       Server input devices at any sample rate → 16 kHz
+discord_source.py    Starts the Node Discord bridge and parses its frames
+discord_pipeline.py  Per-speaker VAD + recognition for the Discord source
+discord_bridge/      Node.js bot: follows a user, receives each speaker's
+                     audio (DISCORD.md)
+```
 
 ## How each module was verified
 

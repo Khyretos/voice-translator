@@ -173,9 +173,9 @@ See `requirements.txt` for the full, current list (gradio, vosk, sounddevice, mo
    Use the included `download_vosk_models.py` script:
 
    ```bash
-   python download_vosk_models.py en-us-small # light English model
-   python download_vosk_models.py en-us # full English model
-   python download_vosk_models.py es fr de # multiple languages
+   python download_vosk_models.py --list --lang en-us        # see what's available
+   python download_vosk_models.py --lang en-us --small       # current small English model
+   python download_vosk_models.py vosk-model-small-es-0.42   # an exact model by name
    ```
 
    Models are placed in the `vosk_models/` directory.

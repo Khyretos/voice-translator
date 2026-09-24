@@ -1,6 +1,8 @@
 # Audio sources (Phase 3)
 
-"Audio Mode" (hardware/browser) is now "Audio Source", with three options.
+"Audio Mode" (hardware/browser) is now "Audio Source", with four options
+(the fourth, **Discord Voice Channel**, is described in
+[DISCORD.md](./DISCORD.md)).
 None of them are magic — each is a different, real way of getting audio
 into the same recognition pipeline, with different capabilities/limits.
 
@@ -78,3 +80,23 @@ route the desktop app through a virtual device instead (see option 1).
 
 Old saved `audio_mode: "browser"` is automatically migrated to
 `"browser_mic"` on load — no action needed.
+
+## 4. Discord Voice Channel
+
+A bot joins the Discord voice channel you're in and receives each person's
+audio separately, so every speaker is captioned on their own row with their
+avatar and name — no need to route Discord's audio through a virtual device
+at all. See [DISCORD.md](./DISCORD.md).
+
+## When a source goes away
+
+Whatever the source, a running session stops by itself when its audio is
+really gone — a server device unplugged, a browser mic disconnected, tab
+sharing stopped, the tab closed, or (Discord) you leaving the voice channel.
+The reason is shown in the Status box. Silence never counts as "gone". The
+delay is **Auto-stop when audio is lost** in the Audio settings (0 = never).
+See [SESSIONS.md](./SESSIONS.md).
+
+Server devices that can't record at 16 kHz ("Invalid sample rate
+[PaErrorCode -9997]") are opened at their own rate and resampled
+automatically (`audio_input.py`).

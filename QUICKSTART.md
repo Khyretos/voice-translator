@@ -5,8 +5,10 @@
 - **Argos Translate** – offline translation (no internet needed)
 - **Whisper API** – use a Whisper server for transcription/translation
 - **Multiple translation backends** – AI, LibreTranslate, internal, whisper_translate
-- **Pop‑out display** – perfect for OBS overlays
-- **Session isolation** – each browser tab is independent
+- **Pop‑out display** – perfect for OBS overlays; the popout ID is saved, so the OBS URL survives restarts
+- **Named sessions** – `?session=<name>` gives you a session with its own saved settings that survives reloads and reconnects
+- **Discord voice channel** – caption everyone in a Discord call separately, with avatars ([DISCORD.md](./DISCORD.md))
+- **Live Whisper** – captions while you talk, never piling up behind a slow server
 
 ## Fastest Way to Get Started
 
@@ -30,7 +32,8 @@ setup.bat
 ```bash
 # Activate virtual environment (if not already)
 source venv/bin/activate # or venv\Scripts\activate on Windows
-python download_vosk_models.py en-us-small # 40 MB English model
+python download_vosk_models.py --lang en-us --small # current small (~40 MB) English model
+python download_vosk_models.py --list                # everything available
 ```
 
 ### 3. (Optional) Download Argos models for offline translation
@@ -43,8 +46,10 @@ python download_argos_model.py --common # common language pairs
 ### 4. Start the app
 
 ```bash
-python app.py
+python voice_translator.py
 ```
+
+(or `start.bat` on Windows). With Docker instead: `docker compose up -d --build`.
 
 Open your browser to `http://localhost:7860`.
 
@@ -54,7 +59,8 @@ Open your browser to `http://localhost:7860`.
 
 2. **Select a Vosk model** from the dropdown
 
-3. **Pick your microphone** (hardware mode)
+3. **Pick your audio source**: a server audio device, this browser's microphone,
+   a shared browser tab / system audio, or a Discord voice channel
 
 4. **Enable Translation** and choose a mode:
    - **Argos** – offline, requires models
@@ -77,7 +83,8 @@ Open your browser to `http://localhost:7860`.
 
 2. In OBS, add a **Browser Source** and paste the URL.
 
-3. Set width/height (e.g., 1920×200).
+3. Set width/height (e.g., 1920×200 for a caption bar, or 1920×1080 with
+   **Vertical position: Bottom** for subtitles over the whole stream).
 
 4. (Optional) Add custom CSS to remove background:
 

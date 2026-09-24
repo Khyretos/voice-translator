@@ -106,7 +106,7 @@ echo ========================================
 echo.
 echo To start the application:
 echo    venv\Scripts\activate.bat
-echo    python app.py
+echo    python voice_translator.py
 echo.
 echo Or simply run: start.bat
 echo.

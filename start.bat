@@ -15,6 +15,6 @@ if exist "venv\Scripts\activate.bat" (
 )
 
 REM Start the application
-python app.py
+python voice_translator.py
 
 pause
