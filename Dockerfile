@@ -38,7 +38,7 @@ COPY *.py ./
 # Discord bridge: Node runtime + the bridge script and its packages
 COPY --from=discord-bridge /usr/local/bin/node /usr/local/bin/node
 COPY --from=discord-bridge /bridge/node_modules ./discord_bridge/node_modules
-COPY discord_bridge/bridge.js discord_bridge/package.json ./discord_bridge/
+COPY discord_bridge/*.js discord_bridge/package.json ./discord_bridge/
 
 # Create required directories
 RUN mkdir -p /voice_translator/vosk_models /voice_translator/argos_models /voice_translator/logs /voice_translator/fonts /app/settings

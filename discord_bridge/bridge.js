@@ -60,29 +60,12 @@ function log(...args) {
   console.error('[discord-bridge]', ...args);
 }
 
-// ── 48 kHz stereo → 16 kHz mono ─────────────────────────────────────────────
-// 48 000 / 16 000 is exactly 3, so each output sample is the average of three
-// input frames (both channels) — a boxcar low-pass + decimation in one step.
-class Downsampler {
-  constructor() {
-    this.carry = Buffer.alloc(0);
-  }
-  push(chunk) {
-    const buf = this.carry.length ? Buffer.concat([this.carry, chunk]) : chunk;
-    const frameBytes = 4; // stereo int16
-    const groups = Math.floor(buf.length / (frameBytes * 3));
-    const out = Buffer.alloc(groups * 2);
-    for (let g = 0; g < groups; g++) {
-      const base = g * frameBytes * 3;
-      let sum = 0;
-      for (let f = 0; f < 3; f++) {
-        sum += buf.readInt16LE(base + f * 4) + buf.readInt16LE(base + f * 4 + 2);
-      }
-      out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(sum / 6))), g * 2);
-    }
-    this.carry = Buffer.from(buf.subarray(groups * frameBytes * 3));
-    return out;
-  }
+const { Downsampler, createOpusDecoder } = require('./audio');
+
+// Human-readable warnings for the app's log (stderr lines are debug-level).
+function warn(message) {
+  log(message);
+  send({ type: 'log', level: 'warning', message });
 }
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
@@ -176,7 +159,6 @@ async function runDiscord() {
   const {
     joinVoiceChannel, entersState, VoiceConnectionStatus, EndBehaviorType, getVoiceConnection,
   } = require('@discordjs/voice');
-  const prism = require('prism-media');
 
   if (!TOKEN) {
     send({ type: 'error', message: 'No Discord bot token set' });
@@ -203,6 +185,13 @@ async function runDiscord() {
   const subscriptions = new Map(); // userId -> { stream, decoder }
   const announced = new Set();
 
+  // Health: audio is arriving but none of it can be decoded → the end-to-end
+  // encryption session is stuck. Rejoining with a fresh connection is what a
+  // restart did by hand; do it automatically (at most every 30 s).
+  const health = { badSince: 0, bad: 0, lastGood: Date.now(), lastRejoin: 0 };
+  let leavingOnPurpose = false; // our own destroy() → ignore the bot's "left" event
+  const errorLogAt = new Map(); // userId -> last time a decode error was logged
+
   async function announceSpeaker(guild, userId) {
     if (announced.has(userId)) return;
     announced.add(userId);
@@ -223,7 +212,7 @@ async function runDiscord() {
     if (!sub) return;
     subscriptions.delete(userId);
     try { sub.stream.destroy(); } catch (e) {}
-    try { sub.decoder.destroy(); } catch (e) {}
+    if (sub.decoder.delete) sub.decoder.delete();
   }
 
   function subscribe(guild, userId) {
@@ -231,20 +220,57 @@ async function runDiscord() {
     const opusStream = connection.receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
     });
-    const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+    const decoder = createOpusDecoder();
     const ds = new Downsampler();
     subscriptions.set(userId, { stream: opusStream, decoder });
     announceSpeaker(guild, userId);
     opusStream.on('error', err => log(`stream error for ${userId}:`, err.message));
-    decoder.on('error', err => log(`decode error for ${userId}:`, err.message));
-    decoder.on('data', pcm => {
+    // Flowing mode ('data'), so 'end' always fires after the silence
+    // timeout and the next time this person talks they get a fresh stream.
+    opusStream.on('data', packet => {
+      let pcm;
+      try {
+        pcm = decoder.decode(packet);
+      } catch (err) {
+        noteBadPacket(userId, err);
+        return;
+      }
+      health.lastGood = Date.now();
+      health.bad = 0;
+      health.badSince = 0;
       if (ignore.has(userId)) return;
       const out = ds.push(pcm);
       if (out.length) sendAudio(userId, out);
     });
-    opusStream.pipe(decoder);
     opusStream.once('end', () => unsubscribe(userId));
     opusStream.once('close', () => unsubscribe(userId));
+  }
+
+  function noteBadPacket(userId, err) {
+    const now = Date.now();
+    if (!health.bad) health.badSince = now;
+    health.bad++;
+    if (now - (errorLogAt.get(userId) || 0) > 10000) {
+      errorLogAt.set(userId, now);
+      log(`decode error for ${userId}: ${err.message} (skipped; normal for a moment while encryption keys change)`);
+    }
+    // Several seconds of nothing but undecodable audio: the encryption
+    // session didn't recover by itself.
+    if (health.bad >= 150 && now - health.badSince > 4000 && now - health.lastGood > 4000) {
+      rejoinFresh('audio from Discord could not be decrypted');
+    }
+  }
+
+  async function rejoinFresh(why) {
+    const now = Date.now();
+    if (!currentGuild || !currentChannelId || now - health.lastRejoin < 30000) return;
+    health.lastRejoin = now;
+    health.bad = 0;
+    health.badSince = 0;
+    const channel = currentGuild.channels.cache.get(currentChannelId);
+    if (!channel) return;
+    warn(`Discord: ${why} — reconnecting to #${channel.name}`);
+    await join(channel, true);
   }
 
   function leave(reason) {
@@ -258,10 +284,18 @@ async function runDiscord() {
     send({ type: 'voice', state: 'left', reason });
   }
 
-  async function join(channel) {
-    if (currentChannelId === channel.id && connection) return;
+  async function join(channel, force = false) {
+    if (!force && currentChannelId === channel.id && connection) return;
     for (const id of [...subscriptions.keys()]) unsubscribe(id);
-    if (connection) { try { connection.destroy(); } catch (e) {} }
+    if (connection) {
+      // Leave cleanly before joining again: a fresh connection gets a fresh
+      // encryption session. Our own leave shows up as a "bot left voice"
+      // event — that one mustn't stop the session.
+      leavingOnPurpose = true;
+      try { connection.destroy(); } catch (e) {}
+      connection = null;
+      await new Promise(r => setTimeout(r, 750));
+    }
     currentChannelId = channel.id;
     currentGuild = channel.guild;
     log(`joining #${channel.name} in ${channel.guild.name}`);
@@ -285,6 +319,8 @@ async function runDiscord() {
       return;
     }
     if (connection !== conn) return;
+    leavingOnPurpose = false;
+    health.lastGood = Date.now();
     send({ type: 'voice', state: 'joined', guild: channel.guild.name, channel: channel.name });
     conn.receiver.speaking.on('start', userId => {
       if (connection === conn) subscribe(channel.guild, userId);
@@ -340,8 +376,21 @@ async function runDiscord() {
       } else if (!newState.channelId && oldState.channelId) {
         leave('you left the voice channel');
       }
-    } else if (newState.id === client.user.id && !newState.channelId && currentChannelId) {
-      leave('the bot was disconnected from the voice channel');
+    } else if (newState.id === client.user.id) {
+      if (!newState.channelId) {
+        if (leavingOnPurpose) return; // our own rejoin/move
+        if (currentChannelId) leave('the bot was disconnected from the voice channel');
+      } else if (newState.channelId !== currentChannelId && currentChannelId) {
+        // Someone dragged the bot into another channel. It's meant to follow
+        // you, so go back to your channel (with a fresh connection).
+        const mine = findFollowedChannel();
+        if (mine && mine.id !== newState.channelId) {
+          warn(`Discord: the bot was moved to #${newState.channel.name} — returning to #${mine.name}`);
+          await join(mine, true);
+        } else if (mine) {
+          currentChannelId = mine.id;
+        }
+      }
     }
   });
 
