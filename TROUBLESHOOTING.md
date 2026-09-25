@@ -172,6 +172,18 @@ reports most problems directly.
   are now skipped. If audio stays undecodable for several seconds, the bot
   rejoins the channel by itself and logs `could not be decrypted —
   reconnecting` as a warning.
+- **Captions stop after a while with no error** (level meter frozen): the
+  app now recovers from this by itself. If audio is arriving but can't be
+  decrypted for 5 s, or no audio arrives for 2 minutes while people are in
+  the channel, the voice connection is refreshed without leaving the channel
+  (no join/leave sound). If the bridge itself freezes or crashes, it's
+  restarted. Each recovery is logged as a warning. Every 5 minutes the log
+  shows a status line, e.g. `Discord status: connected to #general — last 5
+  min: 212s of speech from 3 speaker(s), 10400 audio frames decoded, 0
+  decrypt failures, 0 connection refreshes`. If captions stop, that line
+  shows where: no speech received (Discord side), speech received but
+  nothing decoded (encryption), or speech received and decoded but no text
+  (Whisper/translation side).
 - **The bot was dragged to another channel**: it goes back to the channel
   of the user it follows (logged as a warning).
 - **Someone isn't captioned**: check they're not in **Ignore these user IDs**,

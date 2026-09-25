@@ -1664,6 +1664,25 @@ class VoiceTranslatorApp:
         """
         if not self.is_running:
             return
+        pt = getattr(self, "process_thread", None)
+        if pt is not None and not pt.is_alive() and self.is_running:
+            # Should never happen (the loop catches everything), but if the
+            # audio-processing thread ever dies, audio would silently pile up
+            # unprocessed. Start a new one.
+            self.logger.log(
+                "Audio processing thread stopped unexpectedly — restarting it",
+                level="error",
+            )
+            self.process_thread = threading.Thread(
+                target=self.process_audio_hardware, daemon=True
+            )
+            self.process_thread.start()
+        if self.discord is not None:
+            # Silence is normal for Discord (it only sends audio while someone
+            # talks). The pipeline watches the bridge's heartbeat instead and
+            # reconnects it if it froze or crashed; leaving the channel is
+            # reported by the bridge itself.
+            self.discord.check_health()
         try:
             timeout = float(self.settings.get("audio_watchdog_seconds", 8) or 0)
         except (TypeError, ValueError):
@@ -1673,11 +1692,7 @@ class VoiceTranslatorApp:
         now = time.time()
         reason = None
         if self.settings.get("audio_mode") == "discord":
-            # Silence is normal here (Discord only sends audio while someone
-            # talks); what matters is that the bridge is still connected.
-            # Leaving the channel / disconnects are reported by the bridge.
-            if self.discord is not None and not self.discord.alive:
-                reason = "🔌 Discord connection lost — session stopped"
+            pass  # handled above (check_health), independent of the timeout
         elif self.settings.get("audio_mode") == "hardware":
             stream = self.stream
             if stream is not None and not stream.active:
