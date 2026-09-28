@@ -1,0 +1,33 @@
+name: Bug report
+about: Something doesn't work the way it should
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Click ...
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: e.g. v1.2.0, or the commit
+  - type: input
+    id: system
+    attributes:
+      label: Operating system
+      placeholder: e.g. Arch Linux, Windows 11
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      render: text
