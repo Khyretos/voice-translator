@@ -4,5 +4,12 @@
     "config:recommended",
     ":dependencyDashboard",
     "schedule:weekly"
+  ],
+  "packageRules": [
+    {
+      "description": "prism-media 1.x (used by @discordjs/voice) only accepts opusscript 0.0.x",
+      "matchPackageNames": ["opusscript"],
+      "allowedVersions": "<0.1.0"
+    }
   ]
 }
