@@ -2,7 +2,7 @@
 # Only used by the optional "Discord Voice Channel" audio source (DISCORD.md).
 # Built in its own stage so the final image just gets the node binary and the
 # installed packages, not npm or any build tools.
-FROM node:22-bookworm-slim AS discord-bridge
+FROM node:24-bookworm-slim AS discord-bridge
 WORKDIR /bridge
 COPY discord_bridge/package.json discord_bridge/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
