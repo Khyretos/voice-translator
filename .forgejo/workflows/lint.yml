@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: Check out (plain git)
         run: |
-          git init -q . && git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q "${{ github.server_url }}/${{ github.repository }}" "${{ github.sha }}" && git checkout -q FETCH_HEAD
+          git init -q . && git config core.autocrlf false && git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q "${{ github.server_url }}/${{ github.repository }}" "${{ github.sha }}" && git checkout -q FETCH_HEAD
       - name: MegaLinter
         env:
           DEFAULT_WORKSPACE: ${{ github.workspace }}

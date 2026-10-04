@@ -18,18 +18,19 @@ jobs:
     runs-on: soucouyant
     container:
       image: oxsecurity/megalinter-python:v9
-      options: --network host   # reach Ollama on soucouyant itself (localhost:11434)
+      options: --network host   # the bridge network can't reach Ollama on the host (firewall)
     env:
-      OLLAMA_URL: http://127.0.0.1:11434/v1/chat/completions
+      OLLAMA_URL: http://192.168.178.80:11434/v1/chat/completions
       CI_RAW: ${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main
       BRANCH: lint-fix/auto
     steps:
       - name: Check out (plain git, push access)
         run: |
-          git init -q . && git remote add origin "${{ github.server_url }}/${{ github.repository }}"
+          git init -q . && git config core.autocrlf false   # the image sets autocrlf=true: whole-file CRLF diffs
+          git remote add origin "${{ github.server_url }}/${{ github.repository }}"
           git config http.extraHeader "Authorization: token ${{ github.token }}"
           git fetch -q origin "${{ github.ref_name }}" && git checkout -q -B "$BRANCH" FETCH_HEAD
-          git config core.autocrlf false && git config user.name "kompas-lint" && git config user.email "lint@kreative-kompas.com"
+          git config user.name "kompas-lint" && git config user.email "lint@kreative-kompas.com"
           echo "megalinter-reports/" >> .git/info/exclude && echo "ai-fixes.json" >> .git/info/exclude
           curl -sf "$CI_RAW/lint_ai_fix.py" -o /tmp/lint_ai_fix.py && curl -sf "$CI_RAW/lint_fix_pr.py" -o /tmp/lint_fix_pr.py && curl -sf "$CI_RAW/keep_eol.py" -o /tmp/keep_eol.py
       - name: MegaLinter with automatic fixes
