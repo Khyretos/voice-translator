@@ -5,7 +5,6 @@ import shutil
 import subprocess
 
 import pytest
-
 from discord_source import BRIDGE_DIR
 
 pytestmark = pytest.mark.skipif(
@@ -41,7 +40,11 @@ def test_corrupt_packet_does_not_stop_the_speakers_audio():
     # (which Discord's E2E encryption produces while keys change), silently
     # ending that speaker's audio until a restart.
     res = subprocess.run(
-        ["node", "-e", _SCRIPT], cwd=BRIDGE_DIR, capture_output=True, text=True, timeout=30
+        ["node", "-e", _SCRIPT],
+        cwd=BRIDGE_DIR,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     assert res.returncode == 0, res.stderr
     r = json.loads(res.stdout)

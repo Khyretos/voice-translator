@@ -17,7 +17,6 @@ import threading
 import time
 
 import numpy as np
-
 from discord_source import DiscordBridge, bridge_available, parse_id_list
 from live_whisper import LiveWhisperWorker
 
@@ -206,7 +205,9 @@ class DiscordPipeline:
             sp.worker.submit_final(seg)
             sp.last_interim = time.monotonic()
         if app.settings.get("whisper_interim", True):
-            sp.last_interim = app.maybe_submit_interim(sp.vad, sp.worker, sp.last_interim)
+            sp.last_interim = app.maybe_submit_interim(
+                sp.vad, sp.worker, sp.last_interim
+            )
 
     def tick(self):
         """Close utterances of speakers who went quiet (no packets from Discord)."""

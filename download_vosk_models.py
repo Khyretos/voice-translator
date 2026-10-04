@@ -93,7 +93,9 @@ def download_model(entry: dict, models_dir: Path) -> bool:
         return True
 
     print(f"📥 Downloading {entry['name']} ({entry.get('size_text', '?')})")
-    print(f"   {entry.get('lang_text', entry.get('lang', ''))} — {entry.get('type', '')}")
+    print(
+        f"   {entry.get('lang_text', entry.get('lang', ''))} — {entry.get('type', '')}"
+    )
 
     temp_dir = models_dir / "temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -159,13 +161,17 @@ def print_catalog(catalog: list[dict], lang_filter: str | None, show_obsolete: b
     for e in entries:
         by_lang.setdefault(e["lang"], []).append(e)
 
-    print(f"\n📋 {len(entries)} model(s){' (including obsolete)' if show_obsolete else ''}:\n")
+    print(
+        f"\n📋 {len(entries)} model(s){' (including obsolete)' if show_obsolete else ''}:\n"
+    )
     for lang in sorted(by_lang):
         lang_text = by_lang[lang][0].get("lang_text", lang)
         print(f"{lang_text} ({lang})")
         for e in sorted(by_lang[lang], key=lambda x: x["name"]):
             flag = " [obsolete]" if is_obsolete(e) else ""
-            print(f"    {e['name']:45} {e.get('size_text', '?'):>10}  [{e['type']}]{flag}")
+            print(
+                f"    {e['name']:45} {e.get('size_text', '?'):>10}  [{e['type']}]{flag}"
+            )
         print()
 
 
@@ -184,9 +190,13 @@ Examples:
         """,
     )
     parser.add_argument(
-        "names", nargs="*", help="Exact model name(s) from --list, e.g. vosk-model-small-en-us-0.15"
+        "names",
+        nargs="*",
+        help="Exact model name(s) from --list, e.g. vosk-model-small-en-us-0.15",
     )
-    parser.add_argument("--list", action="store_true", help="List available models and exit")
+    parser.add_argument(
+        "--list", action="store_true", help="List available models and exit"
+    )
     parser.add_argument("--lang", help="Filter by language code (e.g. en-us, es, fr)")
     parser.add_argument(
         "--all", action="store_true", help="Include obsolete models in --list"

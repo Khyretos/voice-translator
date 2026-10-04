@@ -8,6 +8,7 @@ import re
 import threading
 import time
 
+
 class SubtitleManager:
     """
     Buffers and paces subtitle display.
@@ -354,7 +355,8 @@ class SpeakerBoard:
         now = time.time()
         with self._lock:
             active = [
-                s for s in self._speakers.values()
+                s
+                for s in self._speakers.values()
                 if s["rec"] and now - s["updated"] <= self.fade_timeout
             ]
             active.sort(key=lambda s: s["updated"], reverse=True)

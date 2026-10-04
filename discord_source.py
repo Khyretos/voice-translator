@@ -190,7 +190,13 @@ def check_bot(token: str, follow_user_id: str, timeout: float = 25.0) -> dict:
         done.set()
 
     bridge = DiscordBridge(
-        token, follow_user_id, [], on_event, lambda *a: None, on_exit=on_exit, mode="check"
+        token,
+        follow_user_id,
+        [],
+        on_event,
+        lambda *a: None,
+        on_exit=on_exit,
+        mode="check",
     )
     if not done.wait(timeout):
         result = {"type": "error", "message": "Timed out talking to Discord"}

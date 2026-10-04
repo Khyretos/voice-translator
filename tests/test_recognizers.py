@@ -2,7 +2,6 @@
 WhisperRecognizer's client-side confidence filtering (no network calls)."""
 
 import pytest
-
 from recognizers import (
     ArgosTranslator,
     WhisperRecognizer,
@@ -94,8 +93,12 @@ class TestWhisperRecognizerResponseFiltering:
         wr = self.make_recognizer()
         result = {
             "segments": [
-                {"text": "thank you", "no_speech_prob": 0.95, "avg_logprob": -0.1,
-                 "compression_ratio": 1.0},
+                {
+                    "text": "thank you",
+                    "no_speech_prob": 0.95,
+                    "avg_logprob": -0.1,
+                    "compression_ratio": 1.0,
+                },
             ]
         }
         assert wr._extract_text(result) == ""
@@ -104,8 +107,12 @@ class TestWhisperRecognizerResponseFiltering:
         wr = self.make_recognizer()
         result = {
             "segments": [
-                {"text": "garbled", "no_speech_prob": 0.1, "avg_logprob": -2.5,
-                 "compression_ratio": 1.0},
+                {
+                    "text": "garbled",
+                    "no_speech_prob": 0.1,
+                    "avg_logprob": -2.5,
+                    "compression_ratio": 1.0,
+                },
             ]
         }
         assert wr._extract_text(result) == ""
@@ -114,8 +121,12 @@ class TestWhisperRecognizerResponseFiltering:
         wr = self.make_recognizer()
         result = {
             "segments": [
-                {"text": "repeat repeat repeat repeat", "no_speech_prob": 0.1,
-                 "avg_logprob": -0.1, "compression_ratio": 5.0},
+                {
+                    "text": "repeat repeat repeat repeat",
+                    "no_speech_prob": 0.1,
+                    "avg_logprob": -0.1,
+                    "compression_ratio": 5.0,
+                },
             ]
         }
         assert wr._extract_text(result) == ""
@@ -124,8 +135,12 @@ class TestWhisperRecognizerResponseFiltering:
         wr = self.make_recognizer()
         result = {
             "segments": [
-                {"text": "hello there", "no_speech_prob": 0.05, "avg_logprob": -0.1,
-                 "compression_ratio": 1.2},
+                {
+                    "text": "hello there",
+                    "no_speech_prob": 0.05,
+                    "avg_logprob": -0.1,
+                    "compression_ratio": 1.2,
+                },
             ]
         }
         assert wr._extract_text(result) == "hello there"
@@ -134,12 +149,24 @@ class TestWhisperRecognizerResponseFiltering:
         wr = self.make_recognizer()
         result = {
             "segments": [
-                {"text": "hello", "no_speech_prob": 0.05, "avg_logprob": -0.1,
-                 "compression_ratio": 1.2},
-                {"text": "thank you", "no_speech_prob": 0.9, "avg_logprob": -0.1,
-                 "compression_ratio": 1.2},
-                {"text": "world", "no_speech_prob": 0.05, "avg_logprob": -0.1,
-                 "compression_ratio": 1.2},
+                {
+                    "text": "hello",
+                    "no_speech_prob": 0.05,
+                    "avg_logprob": -0.1,
+                    "compression_ratio": 1.2,
+                },
+                {
+                    "text": "thank you",
+                    "no_speech_prob": 0.9,
+                    "avg_logprob": -0.1,
+                    "compression_ratio": 1.2,
+                },
+                {
+                    "text": "world",
+                    "no_speech_prob": 0.05,
+                    "avg_logprob": -0.1,
+                    "compression_ratio": 1.2,
+                },
             ]
         }
         assert wr._extract_text(result) == "hello world"
@@ -175,8 +202,16 @@ class TestWhisperCustomResponsePath:
     def test_default_uses_verbose_json_segments(self):
         wr = WhisperRecognizer(host="http://x", model="m")
         assert wr.response_text_path is None
-        result = {"segments": [{"text": "hello", "no_speech_prob": 0.05,
-                                 "avg_logprob": -0.1, "compression_ratio": 1.2}]}
+        result = {
+            "segments": [
+                {
+                    "text": "hello",
+                    "no_speech_prob": 0.05,
+                    "avg_logprob": -0.1,
+                    "compression_ratio": 1.2,
+                }
+            ]
+        }
         assert wr._extract_text(result) == "hello"
 
     def test_custom_path_bypasses_segment_filtering(self):
@@ -199,8 +234,16 @@ class TestWhisperCustomResponsePath:
         wr = WhisperRecognizer(
             host="http://x", model="m", response_text_path="totally.wrong.path"
         )
-        result = {"segments": [{"text": "fallback works", "no_speech_prob": 0.05,
-                                 "avg_logprob": -0.1, "compression_ratio": 1.2}]}
+        result = {
+            "segments": [
+                {
+                    "text": "fallback works",
+                    "no_speech_prob": 0.05,
+                    "avg_logprob": -0.1,
+                    "compression_ratio": 1.2,
+                }
+            ]
+        }
         assert wr._extract_text(result) == "fallback works"
 
 
