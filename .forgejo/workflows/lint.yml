@@ -29,6 +29,7 @@ jobs:
           # Quiet by default (spelling, link checks, type checkers that need the project's
           # dependencies installed, duplicate-code); a repo can re-enable them in .mega-linter.yml
           DISABLE_LINTERS: SPELL_CSPELL,SPELL_LYCHEE,COPYPASTE_JSCPD,PYTHON_PYLINT,PYTHON_PYRIGHT,PYTHON_MYPY,PYTHON_FLAKE8,MARKDOWN_MARKDOWN_TABLE_FORMATTER,REPOSITORY_CHECKOV
+          PYTHON_BANDIT_ARGUMENTS: "-ll"   # medium and high severity only
           APPLY_FIXES: none
           DISABLE_ERRORS: "true"    # report only; set to "false" to fail the check on errors
           SHOW_ELAPSED_TIME: "true"
