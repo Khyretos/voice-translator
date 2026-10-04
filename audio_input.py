@@ -26,7 +26,9 @@ class StreamResampler:
 
     def __init__(self, in_rate: float, out_rate: int = TARGET_RATE):
         self.step = float(in_rate) / out_rate
-        self.t = 0.0  # next output position, in input samples; -1 = previous block's last
+        self.t = (
+            0.0  # next output position, in input samples; -1 = previous block's last
+        )
         self.prev = 0.0
         self.taps = max(1, min(8, int(round(self.step))))
         self._hist = np.zeros(self.taps - 1, dtype=np.float32)
@@ -36,8 +38,10 @@ class StreamResampler:
             return np.zeros(0, dtype=np.float32)
         if self.taps > 1:
             padded = np.concatenate((self._hist, x))
-            self._hist = padded[-(self.taps - 1):].copy()
-            x = np.convolve(padded, np.full(self.taps, 1.0 / self.taps, np.float32), "valid")
+            self._hist = padded[-(self.taps - 1) :].copy()
+            x = np.convolve(
+                padded, np.full(self.taps, 1.0 / self.taps, np.float32), "valid"
+            )
         L = x.size
         if self.t >= L - 1:
             n = 0
@@ -76,7 +80,9 @@ def open_input_stream(device, callback, logger=None):
     for rate in _candidate_rates(device):
         if rate == TARGET_RATE:
             try:
-                sd.check_input_settings(device=device, samplerate=rate, channels=1, dtype="int16")
+                sd.check_input_settings(
+                    device=device, samplerate=rate, channels=1, dtype="int16"
+                )
                 return sd.RawInputStream(
                     samplerate=rate,
                     blocksize=TARGET_RATE * BLOCK_MS // 1000,
@@ -89,7 +95,9 @@ def open_input_stream(device, callback, logger=None):
                 last_error = exc
                 continue
         try:
-            sd.check_input_settings(device=device, samplerate=rate, channels=1, dtype="float32")
+            sd.check_input_settings(
+                device=device, samplerate=rate, channels=1, dtype="float32"
+            )
         except Exception as exc:
             last_error = exc
             continue

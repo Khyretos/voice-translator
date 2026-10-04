@@ -16,36 +16,31 @@ import gradio as gr
 import numpy as np
 import requests
 import sounddevice as sd
-import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from vosk import KaldiRecognizer, Model
-
-from logger import Logger
 import translators as tmod
-from translators import TranslationService
-
-# ── Recognizer / translation backends (see recognizers.py) ───────────────────
-from recognizers import (
-    ARGOS_AVAILABLE,
-    MOONSHINE_LANGUAGES,
-    ArgosTranslator,
-    MoonshineRecognizer,
-    WhisperRecognizer,
-    _MOONSHINE_AVAILABLE,
-    dots_or_stars,
-    is_whisper_hallucination,
-)
-from vad import FastVAD, _WRTCVAD_AVAILABLE
-from live_whisper import LiveWhisperWorker
+import uvicorn
 from audio_input import open_input_stream
 from discord_pipeline import DiscordPipeline
 from discord_source import bridge_available as discord_bridge_available
 from discord_source import check_bot as check_discord
 from discord_source import invite_url as discord_invite_url
-from subtitles import SpeakerBoard, SubtitleManager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from live_whisper import LiveWhisperWorker
+from logger import Logger
+
+# ── Recognizer / translation backends (see recognizers.py) ───────────────────
+from recognizers import (
+    _MOONSHINE_AVAILABLE,
+    ARGOS_AVAILABLE,
+    MOONSHINE_LANGUAGES,
+    ArgosTranslator,
+    MoonshineRecognizer,
+    WhisperRecognizer,
+    dots_or_stars,
+    is_whisper_hallucination,
+)
 from session import (
     SessionSlugMiddleware,
     get_slug,
@@ -57,6 +52,10 @@ from settings_store import (
     load_saved_settings,
     persist_settings,
 )
+from subtitles import SpeakerBoard, SubtitleManager
+from translators import TranslationService
+from vad import _WRTCVAD_AVAILABLE, FastVAD
+from vosk import KaldiRecognizer, Model
 
 if ARGOS_AVAILABLE:
     # Needed directly (not just via ArgosTranslator) for the Argos settings
@@ -89,6 +88,7 @@ _AUDIO_BACKLOG_KEEP_BLOCKS = 10
 # Audio watchdog (see VoiceTranslatorApp.check_audio_watchdog)
 _HW_WATCHDOG_MAX_S = 3.0  # a server device calls back every 30 ms, even in silence
 _BROWSER_START_GRACE_S = 30.0  # time for the mic prompt / screen-share picker
+
 
 # ── Font helpers ──────────────────────────────────────────────────────────────
 def get_available_fonts():
@@ -800,6 +800,7 @@ vtWhenReady(function() {
 
 # SubtitleManager now lives in subtitles.py — imported above.
 
+
 # ── VoiceTranslatorApp ────────────────────────────────────────────────────────
 class VoiceTranslatorApp:
     # Default settings – overridden by saved settings on load
@@ -934,7 +935,9 @@ class VoiceTranslatorApp:
 
         self.recognizer = None
         self.model = None
-        self._vosk_model_path: str | None = None  # which path self.model is a shared reference to — needed by _unload_vosk to release the right cache entry
+        self._vosk_model_path: str | None = (
+            None  # which path self.model is a shared reference to — needed by _unload_vosk to release the right cache entry
+        )
         self.whisper_recognizer: WhisperRecognizer | None = None
         self.moonshine_recognizer: MoonshineRecognizer | None = None
         self.argos_translator: ArgosTranslator | None = None
@@ -1087,7 +1090,9 @@ class VoiceTranslatorApp:
         vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 300))
         vad.update_max_segment_ms(self._max_segment_ms())
         vad.update_min_speech_ms(self.settings.get("vad_min_speech_ms", 200))
-        vad.update_noise_filter_threshold(self.settings.get("noise_filter_threshold", 0.0))
+        vad.update_noise_filter_threshold(
+            self.settings.get("noise_filter_threshold", 0.0)
+        )
 
     def apply_subtitle_settings(self):
         """Push latest subtitle settings into SubtitleManager."""
@@ -1319,7 +1324,9 @@ class VoiceTranslatorApp:
             )
 
     @staticmethod
-    def maybe_submit_interim(vad: FastVAD, worker: LiveWhisperWorker, last_at: float) -> float:
+    def maybe_submit_interim(
+        vad: FastVAD, worker: LiveWhisperWorker, last_at: float
+    ) -> float:
         """
         Live partial caption for the utterance still in progress — only while
         the worker is otherwise idle, so it never delays a final. Returns the
@@ -1345,14 +1352,18 @@ class VoiceTranslatorApp:
         if not transcription or dots_or_stars(transcription):
             return ""
         if is_whisper_hallucination(transcription):
-            self.logger.log(f"Blocked hallucination: {repr(transcription)}", level="debug")
+            self.logger.log(
+                f"Blocked hallucination: {repr(transcription)}", level="debug"
+            )
             return ""
         if not self.is_valid_transcription(transcription):
             self.logger.log("Discarded invalid transcription", level="debug")
             return ""
         return transcription
 
-    def _whisper_transcribe(self, rec: WhisperRecognizer, audio: bytes, interim: bool) -> str:
+    def _whisper_transcribe(
+        self, rec: WhisperRecognizer, audio: bytes, interim: bool
+    ) -> str:
         """LiveWhisperWorker's transcribe_fn."""
         return rec.transcribe(
             audio,
@@ -1531,7 +1542,11 @@ class VoiceTranslatorApp:
                 self.logger.log(
                     "Whisper live mode: "
                     + ("greedy decoding" if low_latency else "beam search")
-                    + (", interim captions on" if self.settings.get("whisper_interim", True) else "")
+                    + (
+                        ", interim captions on"
+                        if self.settings.get("whisper_interim", True)
+                        else ""
+                    )
                     + f", max segment {self._max_segment_ms() / 1000:.0f}s",
                     level="info",
                 )
@@ -1763,9 +1778,7 @@ class VoiceTranslatorApp:
             # Let the worker finish the last utterance (in the background, so
             # Stop returns immediately), then release it.
             if self.whisper_worker:
-                threading.Thread(
-                    target=self.whisper_worker.close, daemon=True
-                ).start()
+                threading.Thread(target=self.whisper_worker.close, daemon=True).start()
                 self.whisper_worker = None
 
             # Unload Vosk model to free memory
@@ -1832,7 +1845,9 @@ class VoiceTranslatorApp:
                         self.speaker_board.set_interim(speaker, text)
                     continue
                 if result_type == "final":
-                    audio = (item[2] if len(item) > 2 else None) or self.last_audio_chunk
+                    audio = (
+                        item[2] if len(item) > 2 else None
+                    ) or self.last_audio_chunk
                     if not self.settings["enable_translation"]:
                         self.subtitles.add(text, "")
                     elif self.subtitles.mode == "instant":
@@ -1934,9 +1949,7 @@ class VoiceTranslatorApp:
                 no_speech_threshold=self.settings[
                     "whisper_translate_no_speech_threshold"
                 ],
-                logprob_threshold=self.settings[
-                    "whisper_translate_logprob_threshold"
-                ],
+                logprob_threshold=self.settings["whisper_translate_logprob_threshold"],
                 compression_ratio_threshold=self.settings[
                     "whisper_translate_compression_ratio_threshold"
                 ],
@@ -2051,9 +2064,7 @@ class VoiceTranslatorApp:
             f'padding:20px;background-color:{self._area_bg()};min-height:200px;">'
             f'<div class="vt-lines" style="transition:opacity 0.5s;opacity:1;display:flex;'
             f"flex-direction:column;align-items:{alignment_map[self.settings['text_alignment']]};"
-            f"text-align:{self.settings['text_alignment']};\">"
-            + body
-            + "</div></div>"
+            f"text-align:{self.settings['text_alignment']};\">" + body + "</div></div>"
         )
 
     def speaker_mode(self) -> bool:
@@ -2070,12 +2081,17 @@ class VoiceTranslatorApp:
         """In-app preview for the Discord source: one row per speaker."""
         s = self.settings
         halign = s.get("text_alignment", "center")
-        align_items = {"left": "flex-start", "center": "center", "right": "flex-end"}[halign]
+        align_items = {"left": "flex-start", "center": "center", "right": "flex-end"}[
+            halign
+        ]
         valign = self._VERTICAL_MAP.get(s.get("vertical_alignment", "middle"), "center")
         family = self._get_font_family_css()
-        rec_outline = self._get_outline_css(s.get("outline_width", 0), s.get("outline_color", "#000000"))
+        rec_outline = self._get_outline_css(
+            s.get("outline_width", 0), s.get("outline_color", "#000000")
+        )
         tra_outline = self._get_outline_css(
-            s.get("translated_outline_width", 0), s.get("translated_outline_color", "#000000")
+            s.get("translated_outline_width", 0),
+            s.get("translated_outline_color", "#000000"),
         )
         avatar_px = max(24, int(s["recognized_font_size"] * 1.4))
         direction = "row-reverse" if s.get("discord_avatar_side") == "right" else "row"
@@ -2097,7 +2113,9 @@ class VoiceTranslatorApp:
                 if r["tra"]
                 else ""
             )
-            lines = tra + rec if s.get("translation_position") == "before" else rec + tra
+            lines = (
+                tra + rec if s.get("translation_position") == "before" else rec + tra
+            )
             avatar = (
                 f'<img src="{html.escape(r["avatar"])}" style="width:{avatar_px}px;height:{avatar_px}px;'
                 f'border-radius:50%;flex:none;object-fit:cover">'
@@ -2107,7 +2125,7 @@ class VoiceTranslatorApp:
             )
             out.append(
                 f'<div style="display:flex;flex-direction:{direction};align-items:center;gap:12px;'
-                f'margin:6px 0;text-align:{halign};font-family:{family};white-space:pre-wrap;'
+                f"margin:6px 0;text-align:{halign};font-family:{family};white-space:pre-wrap;"
                 f'{self._box_css(radius=16, padding="8px 14px")}">'
                 f"{avatar}<div>{name}{lines}</div></div>"
             )
@@ -2116,7 +2134,9 @@ class VoiceTranslatorApp:
             f'<div style="display:flex;flex-direction:column;justify-content:{valign};'
             f'padding:20px;background-color:{self._area_bg()};min-height:200px;">'
             f'<div class="vt-lines" style="transition:opacity 0.5s;opacity:1;display:flex;'
-            f'flex-direction:column;align-items:{align_items};">' + "".join(out) + "</div></div>"
+            f'flex-direction:column;align-items:{align_items};">'
+            + "".join(out)
+            + "</div></div>"
         )
 
     def get_current_display(self):
@@ -2159,7 +2179,10 @@ class VoiceTranslatorApp:
         """background_color with background_opacity applied, as CSS."""
         color = str(self.settings.get("background_color") or "#000000").strip()
         try:
-            alpha = max(0, min(100, int(self.settings.get("background_opacity", 100)))) / 100
+            alpha = (
+                max(0, min(100, int(self.settings.get("background_opacity", 100))))
+                / 100
+            )
         except (TypeError, ValueError):
             alpha = 1.0
         m = re.fullmatch(r"#?([0-9a-fA-F]{6})([0-9a-fA-F]{2})?", color)
@@ -2265,12 +2288,17 @@ class VoiceTranslatorApp:
         """
         s = self.settings
         halign = s.get("text_alignment", "center")
-        align_items = {"left": "flex-start", "center": "center", "right": "flex-end"}[halign]
+        align_items = {"left": "flex-start", "center": "center", "right": "flex-end"}[
+            halign
+        ]
         valign = self._VERTICAL_MAP.get(s.get("vertical_alignment", "middle"), "center")
         family = self._get_font_family_css()
-        rec_outline = self._get_outline_css(s.get("outline_width", 0), s.get("outline_color", "#000000"))
+        rec_outline = self._get_outline_css(
+            s.get("outline_width", 0), s.get("outline_color", "#000000")
+        )
         tra_outline = self._get_outline_css(
-            s.get("translated_outline_width", 0), s.get("translated_outline_color", "#000000")
+            s.get("translated_outline_width", 0),
+            s.get("translated_outline_color", "#000000"),
         )
         avatar_px = max(24, int(s["recognized_font_size"] * 1.4))
         direction = "row-reverse" if s.get("discord_avatar_side") == "right" else "row"
@@ -2307,7 +2335,7 @@ class VoiceTranslatorApp:
             f'if(r.avatar){{a=el("img","avatar");a.src=r.avatar;a.alt=""}}'
             f'else{{a=el("div","avatar");a.textContent=(r.name||"?").charAt(0).toUpperCase()}}'
             f"return a}}"
-            f"function makeRow(r){{const row=el(\"div\",\"row fade\");row.dataset.id=r.id;"
+            f'function makeRow(r){{const row=el("div","row fade");row.dataset.id=r.id;'
             f'const body=el("div","body");row._name=el("div","name");row._rec=el("div","rec");'
             f'row._tra=el("div","tra");body.append(row._name);'
             f"if(TRA_FIRST)body.append(row._tra,row._rec);else body.append(row._rec,row._tra);"
@@ -2333,7 +2361,7 @@ class VoiceTranslatorApp:
             f'const row=e.target;if(row.classList&&row.classList.contains("row")&&'
             f'row.classList.contains("fade")){{row.remove();rows.delete(row.dataset.id)}}}});'
             f"update();setInterval(update,150)}});"
-            f"</script></head><body><div id=\"list\"></div></body></html>"
+            f'</script></head><body><div id="list"></div></body></html>'
         )
 
     def generate_popout_html(self) -> str:
@@ -2380,7 +2408,7 @@ class VoiceTranslatorApp:
             f"</style>"
             f"<script>"
             f"let key=null;"
-            f'const $=id=>document.getElementById(id);'
+            f"const $=id=>document.getElementById(id);"
             f"async function update(){{try{{"
             f'const r=await fetch("/popout_data/{self.popout_id}",{{cache:"no-store"}});'
             f"if(!r.ok)return;const d=await r.json();"
@@ -2512,7 +2540,9 @@ def _migrate_vad_threshold(v) -> float:
 # Moonshine (small ONNX models with per-session streaming state that can't be
 # shared) aren't included — see RECOGNITION_QUALITY.md / MODEL_SHARING.md.
 _VOSK_MODEL_LOCK = threading.Lock()
-_VOSK_MODEL_CACHE: dict[str, dict] = {}  # model_path -> {"model": Model, "refcount": int}
+_VOSK_MODEL_CACHE: dict[str, dict] = (
+    {}
+)  # model_path -> {"model": Model, "refcount": int}
 
 
 def _acquire_vosk_model(model_path: str) -> Model:
@@ -2523,9 +2553,7 @@ def _acquire_vosk_model(model_path: str) -> Model:
             entry = {"model": Model(model_path), "refcount": 0}
             _VOSK_MODEL_CACHE[model_path] = entry
         entry["refcount"] += 1
-        print(
-            f"[VOSK] '{model_path}' now shared by {entry['refcount']} session(s)"
-        )
+        print(f"[VOSK] '{model_path}' now shared by {entry['refcount']} session(s)")
         return entry["model"]
 
 
@@ -2553,9 +2581,11 @@ def _release_vosk_model(model_path: str | None):
 
 def _source_ended_reason(detail: str) -> str:
     detail = re.sub(r"[^\w .,:'()-]", "", str(detail or ""))[:80]
-    return "🔌 Browser audio source ended" + (
-        f" ({detail})" if detail else ""
-    ) + " — session stopped"
+    return (
+        "🔌 Browser audio source ended"
+        + (f" ({detail})" if detail else "")
+        + " — session stopped"
+    )
 
 
 def get_or_create_app(slug: str) -> VoiceTranslatorApp:
@@ -2691,7 +2721,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         )
                         open_session_btn = gr.Button("↗️ Go", scale=1, size="sm")
                         random_session_btn = gr.Button(
-                            "🎲 New", scale=1, size="sm",
+                            "🎲 New",
+                            scale=1,
+                            size="sm",
                             elem_id="random-session-btn",
                         )
                     session_dropdown = gr.Dropdown(
@@ -2740,9 +2772,11 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             choices=vosk_choices,
                             value=vosk_value,
                             label="Vosk Model",
-                            info=f"Found {len(vosk_models)} models in vosk_models/"
-                            if vosk_models
-                            else "⚠️ No models found",
+                            info=(
+                                f"Found {len(vosk_models)} models in vosk_models/"
+                                if vosk_models
+                                else "⚠️ No models found"
+                            ),
                             interactive=bool(vosk_models),
                         )
                         refresh_models_btn = gr.Button("🔄 Refresh Models", size="sm")
@@ -3395,7 +3429,11 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                             ["left", "center", "right"], value="center", label="Align"
                         )
                         vertical_alignment = gr.Radio(
-                            [("Top", "top"), ("Middle", "middle"), ("Bottom", "bottom")],
+                            [
+                                ("Top", "top"),
+                                ("Middle", "middle"),
+                                ("Bottom", "bottom"),
+                            ],
                             value="middle",
                             label="Vertical position",
                             info="Bottom + a popout the size of your stream = "
@@ -3625,7 +3663,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 host = headers.get("x-forwarded-host") or headers.get("host")
                 if host:
                     proto = headers.get("x-forwarded-proto") or "http"
-                    base = f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+                    base = (
+                        f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+                    )
             except Exception:
                 pass
             return f"{base}/popout/{app.popout_id}"
@@ -3674,13 +3714,19 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             ).strip()
             if not token:
                 return "❌ Discord: set the bot token first"
-            res = check_discord(token, (app.settings.get("discord_user_id") or "").strip())
+            res = check_discord(
+                token, (app.settings.get("discord_user_id") or "").strip()
+            )
             if res.get("type") != "check":
                 return f"❌ Discord: {res.get('message', 'check failed')}"
             guilds = res.get("guilds") or []
             lines = [f"✅ Logged in as {res.get('bot')} — in {len(guilds)} server(s)"]
             if guilds:
-                lines.append("Servers: " + ", ".join(guilds[:10]) + (" …" if len(guilds) > 10 else ""))
+                lines.append(
+                    "Servers: "
+                    + ", ".join(guilds[:10])
+                    + (" …" if len(guilds) > 10 else "")
+                )
             else:
                 lines.append("⚠️ The bot isn't in any server yet — invite it:")
             lines.append("Invite link: " + discord_invite_url(res.get("bot_id", "")))
@@ -4379,9 +4425,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         }
         """
         open_session_btn.click(fn=None, inputs=[new_session_name], js=_OPEN_SESSION_JS)
-        new_session_name.submit(
-            fn=None, inputs=[new_session_name], js=_OPEN_SESSION_JS
-        )
+        new_session_name.submit(fn=None, inputs=[new_session_name], js=_OPEN_SESSION_JS)
         random_session_btn.click(
             fn=None,
             js="""
@@ -4428,7 +4472,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             fn=None, inputs=[status_text], js="(s) => { window.vtAfterStart(s); }"
         ).then(
             fn=lambda: gr.update(visible=False), outputs=[stop_test_mic_btn]
-        ).then(fn=None, js="startHwLevelPolling")
+        ).then(
+            fn=None, js="startHwLevelPolling"
+        )
 
         # Stop — stop HW polling too
         stop_btn.click(

@@ -5,7 +5,6 @@ import json
 import time
 
 import pytest
-
 import settings_store as ss
 
 
@@ -39,7 +38,9 @@ class TestLoadSavedSettings:
         # pre-named-sessions snapshot.
         ss.SETTINGS_FILE.write_text(json.dumps({"vosk_model": "legacy-en"}))
         ss.SETTINGS_DIR.mkdir(parents=True)
-        (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"vosk_model": "main-current"}))
+        (ss.SETTINGS_DIR / "main.json").write_text(
+            json.dumps({"vosk_model": "main-current"})
+        )
         result = ss.load_saved_settings("brand-new-session")
         assert result == {"vosk_model": "main-current"}
 
@@ -53,23 +54,32 @@ class TestLoadSavedSettings:
 
     def test_new_session_diverges_independently_after_first_save(self):
         ss.SETTINGS_DIR.mkdir(parents=True)
-        (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"vosk_model": "main-v1"}))
+        (ss.SETTINGS_DIR / "main.json").write_text(
+            json.dumps({"vosk_model": "main-v1"})
+        )
         # New session seeds from main...
         seeded = ss.load_saved_settings("khyretos")
         assert seeded == {"vosk_model": "main-v1"}
         # ...but once it's saved, it's independent — a later change to main
         # must not retroactively affect it.
-        ss.persist_settings("khyretos", {"vosk_model": "khyretos-v1", "recognition_engine": "vosk"})
+        ss.persist_settings(
+            "khyretos", {"vosk_model": "khyretos-v1", "recognition_engine": "vosk"}
+        )
         import time as _time
+
         _time.sleep(1.3)
-        (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"vosk_model": "main-v2"}))
+        (ss.SETTINGS_DIR / "main.json").write_text(
+            json.dumps({"vosk_model": "main-v2"})
+        )
         reloaded = ss.load_saved_settings("khyretos")
         assert reloaded["vosk_model"] == "khyretos-v1"
 
     def test_own_slug_file_takes_priority_over_legacy(self):
         ss.SETTINGS_FILE.write_text(json.dumps({"vosk_model": "legacy-en"}))
         ss.SETTINGS_DIR.mkdir(parents=True)
-        (ss.SETTINGS_DIR / "carol.json").write_text(json.dumps({"vosk_model": "carol-es"}))
+        (ss.SETTINGS_DIR / "carol.json").write_text(
+            json.dumps({"vosk_model": "carol-es"})
+        )
         assert ss.load_saved_settings("carol") == {"vosk_model": "carol-es"}
 
     def test_corrupt_file_returns_empty_dict_not_raises(self):
@@ -89,14 +99,20 @@ class TestVadThresholdMigration:
 
     def test_already_db_scale_value_untouched(self):
         ss.SETTINGS_DIR.mkdir(parents=True)
-        (ss.SETTINGS_DIR / "frank.json").write_text(json.dumps({"vad_threshold": -30.0}))
+        (ss.SETTINGS_DIR / "frank.json").write_text(
+            json.dumps({"vad_threshold": -30.0})
+        )
         result = ss.load_saved_settings("frank")
         assert result["vad_threshold"] == -30.0
 
 
 class TestPersistSettings:
     def test_persist_writes_to_disk_after_debounce(self):
-        settings = {"vosk_model": "en", "recognition_engine": "vosk", "not_persistable": "x"}
+        settings = {
+            "vosk_model": "en",
+            "recognition_engine": "vosk",
+            "not_persistable": "x",
+        }
         ss.persist_settings("grace", settings)
         # Debounced 1s — wait past it.
         time.sleep(1.3)
@@ -159,7 +175,9 @@ class TestPopoutId:
     def test_find_slug_by_popout_id(self):
         ss.SETTINGS_DIR.mkdir(parents=True)
         (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"popout_id": "abc"}))
-        (ss.SETTINGS_DIR / "khyretos.json").write_text(json.dumps({"popout_id": "obs1"}))
+        (ss.SETTINGS_DIR / "khyretos.json").write_text(
+            json.dumps({"popout_id": "obs1"})
+        )
         assert ss.find_slug_by_popout_id("obs1") == "khyretos"
         assert ss.find_slug_by_popout_id("missing") is None
         assert ss.find_slug_by_popout_id("") is None

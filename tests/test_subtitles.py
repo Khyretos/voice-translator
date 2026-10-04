@@ -10,7 +10,6 @@ fixed in the timing-pass (see RECOGNITION_QUALITY.md / conversation history):
 import time
 
 import pytest
-
 from subtitles import SubtitleManager
 
 

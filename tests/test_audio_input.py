@@ -21,7 +21,7 @@ def test_tone_frequency_preserved_without_block_glitches():
     t = np.arange(rate) / rate
     x = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
     rs = StreamResampler(rate)
-    out = np.concatenate([rs.process(x[i:i + 1440]) for i in range(0, rate, 1440)])
+    out = np.concatenate([rs.process(x[i : i + 1440]) for i in range(0, rate, 1440)])
     # The 3-tap moving average delays the signal by 1 input sample.
     ref = 0.5 * np.sin(2 * np.pi * 440 * (np.arange(out.size) / 16000 - 1 / rate))
     err = np.abs(out[100:] - ref[100:])

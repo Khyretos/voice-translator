@@ -6,17 +6,14 @@ of "vosk_models/"; a hardcoded, quickly-stale model list) plus the
 obsolete-string-vs-boolean footgun in the live catalog's own JSON shape.
 """
 
-import json
+import importlib.util
 import shutil
 import tempfile
 import zipfile
 from pathlib import Path
 
 import pytest
-
 from conftest import ROOT
-
-import importlib.util
 
 spec = importlib.util.spec_from_file_location(
     "download_vosk_models", ROOT / "download_vosk_models.py"
@@ -31,30 +28,50 @@ spec.loader.exec_module(dvm)
 # actually is, not a JSON boolean.
 SAMPLE_CATALOG = [
     {
-        "lang": "en-us", "lang_text": "US English", "md5": "x",
-        "name": "vosk-model-small-en-us-0.15", "obsolete": "false",
-        "size": 41205931, "size_text": "39.3MiB", "type": "small",
+        "lang": "en-us",
+        "lang_text": "US English",
+        "md5": "x",
+        "name": "vosk-model-small-en-us-0.15",
+        "obsolete": "false",
+        "size": 41205931,
+        "size_text": "39.3MiB",
+        "type": "small",
         "url": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
         "version": "0.15",
     },
     {
-        "lang": "en-us", "lang_text": "US English", "md5": "x",
-        "name": "vosk-model-small-en-us-0.3", "obsolete": "true",
-        "size": 37279669, "size_text": "35.6MiB", "type": "small",
+        "lang": "en-us",
+        "lang_text": "US English",
+        "md5": "x",
+        "name": "vosk-model-small-en-us-0.3",
+        "obsolete": "true",
+        "size": 37279669,
+        "size_text": "35.6MiB",
+        "type": "small",
         "url": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.3.zip",
         "version": "0.3",
     },
     {
-        "lang": "en-us", "lang_text": "US English", "md5": "x",
-        "name": "vosk-model-en-us-0.22", "obsolete": "false",
-        "size": 1913365522, "size_text": "1.8GiB", "type": "big",
+        "lang": "en-us",
+        "lang_text": "US English",
+        "md5": "x",
+        "name": "vosk-model-en-us-0.22",
+        "obsolete": "false",
+        "size": 1913365522,
+        "size_text": "1.8GiB",
+        "type": "big",
         "url": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
         "version": "0.22",
     },
     {
-        "lang": "es", "lang_text": "Spanish", "md5": "x",
-        "name": "vosk-model-small-es-0.42", "obsolete": "false",
-        "size": 39817833, "size_text": "38.0MiB", "type": "small",
+        "lang": "es",
+        "lang_text": "Spanish",
+        "md5": "x",
+        "name": "vosk-model-small-es-0.42",
+        "obsolete": "false",
+        "size": 39817833,
+        "size_text": "38.0MiB",
+        "type": "small",
         "url": "https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip",
         "version": "0.42",
     },
@@ -173,7 +190,10 @@ class TestDownloadModelExtraction:
 
             monkeypatch.setattr(dvm.urllib.request, "urlretrieve", fail_urlretrieve)
 
-            entry = {"name": "vosk-model-small-xx-0.1", "url": "https://example.com/x.zip"}
+            entry = {
+                "name": "vosk-model-small-xx-0.1",
+                "url": "https://example.com/x.zip",
+            }
             ok = dvm.download_model(entry, models_dir)
             assert ok is True
             assert "already exists" in capsys.readouterr().out

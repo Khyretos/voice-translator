@@ -29,6 +29,7 @@ except ImportError:
     ARGOS_AVAILABLE = False
     print("[WARNING] argostranslate not installed. Offline translation disabled.")
 
+
 def dots_or_stars(input_str: str, second_arg=None) -> bool:
     if input_str == "." or re.match(r"<\|.*|>", input_str):
         return True
@@ -241,6 +242,7 @@ def is_whisper_hallucination(text: str) -> bool:
                 return True
     return False
 
+
 class ArgosTranslator:
     """Offline translation using Argos Translate."""
 
@@ -443,7 +445,9 @@ class WhisperRecognizer:
             compression_ratio = seg.get("compression_ratio")
             reason = None
             if no_speech_prob is not None and no_speech_prob > self.no_speech_threshold:
-                reason = f"no_speech_prob {no_speech_prob:.2f} > {self.no_speech_threshold}"
+                reason = (
+                    f"no_speech_prob {no_speech_prob:.2f} > {self.no_speech_threshold}"
+                )
             elif avg_logprob is not None and avg_logprob < self.logprob_threshold:
                 reason = f"avg_logprob {avg_logprob:.2f} < {self.logprob_threshold}"
             elif (
@@ -517,6 +521,7 @@ class WhisperRecognizer:
             if self.logger:
                 self.logger.log(f"Whisper translation error: {e}", level="error")
             return ""
+
 
 MOONSHINE_LANGUAGES = [
     ("English", "en"),

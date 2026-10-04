@@ -196,7 +196,7 @@ See `requirements.txt` for the full, current list (gradio, vosk, sounddevice, mo
    python voice_translator.py
    ```
 
-   Open your browser at http://localhost:7860.
+   Open your browser at <http://localhost:7860>.
 
 ### Method 2: Docker Deployment
 
@@ -290,7 +290,7 @@ Source Language Code: en
 Target Language Code: es
 ```
 
-_Requires the corresponding Argos models installed._
+*Requires the corresponding Argos models installed.*
 
 **AI (Ollama)**
 

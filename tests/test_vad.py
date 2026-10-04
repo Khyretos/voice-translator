@@ -2,8 +2,7 @@
 
 import numpy as np
 import pytest
-
-from vad import FastVAD, _F_BYTES
+from vad import _F_BYTES, FastVAD
 
 
 def silence_bytes(n_frames: int) -> bytes:

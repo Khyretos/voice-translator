@@ -8,7 +8,6 @@ regression tests below for the exact bug this replaced).
 """
 
 import pytest
-
 from session import (
     DEFAULT_SLUG,
     RESERVED_PATH_SEGMENTS,

@@ -10,7 +10,6 @@ import wave
 
 import numpy as np
 import pytest
-
 from discord_source import (
     BRIDGE_DIR,
     DiscordBridge,
@@ -32,7 +31,9 @@ def test_parse_id_list_accepts_any_separator_and_skips_junk():
 
 def test_read_frames_and_split_audio():
     pcm = np.arange(10, dtype=np.int16).tobytes()
-    data = frame(1, b'{"type":"ready"}') + frame(2, struct.pack(">Q", 987654321012345678) + pcm)
+    data = frame(1, b'{"type":"ready"}') + frame(
+        2, struct.pack(">Q", 987654321012345678) + pcm
+    )
     frames = list(read_frames(io.BytesIO(data)))
     assert frames[0] == (1, b'{"type":"ready"}')
     uid, audio = split_audio(frames[1][1])
@@ -74,16 +75,17 @@ def test_bridge_fake_mode_streams_two_speakers(tmp_path):
         if audio[uid] > 16000:  # > 0.5 s at 16 kHz int16
             got_audio.set()
 
-    bridge = DiscordBridge(
-        "", "", [], events.append, on_audio, fake_wav=str(path)
-    )
+    bridge = DiscordBridge("", "", [], events.append, on_audio, fake_wav=str(path))
     try:
         assert got_audio.wait(10)
     finally:
         bridge.stop()
     kinds = [(e.get("type"), e.get("state")) for e in events]
     assert ("voice", "joined") in kinds
-    assert {e.get("name") for e in events if e.get("type") == "speaker"} >= {"Alice", "Bob"}
+    assert {e.get("name") for e in events if e.get("type") == "speaker"} >= {
+        "Alice",
+        "Bob",
+    }
     # 48 kHz stereo in, 16 kHz mono out: 20 ms packets become 640-byte chunks.
     assert all(v % 640 == 0 for v in audio.values())
     assert not bridge.alive
