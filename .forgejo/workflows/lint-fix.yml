@@ -18,7 +18,9 @@ jobs:
     runs-on: soucouyant
     container:
       image: oxsecurity/megalinter-python:v9
+      options: --network host   # reach Ollama on soucouyant itself (localhost:11434)
     env:
+      OLLAMA_URL: http://127.0.0.1:11434/v1/chat/completions
       CI_RAW: ${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main
       BRANCH: lint-fix/auto
     steps:
