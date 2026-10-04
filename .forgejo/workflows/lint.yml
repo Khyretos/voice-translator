@@ -3,9 +3,11 @@
 # and pick the flavour image for the repo's main language:
 #   megalinter-python, -javascript (TS/Angular/React), -java, -cupcake (C/C++ and
 #   most others), -go, -rust, or megalinter (everything, ~10 GB).
-# Results: a summary comment on the PR plus the full logs in the job.
+# Results: one readable summary comment on the PR (updated on every push) plus the
+# full logs in the job. Scripts: public repo khyretos/kompas-ci (lint_summary.py).
 # Fine-tune with a .mega-linter.yml in the repo (DISABLE_LINTERS, rules files).
 name: lint
+enable-email-notifications: true   # branded mail when the check fails or recovers
 on:
   pull_request:
   push:
@@ -19,28 +21,39 @@ jobs:
     steps:
       - name: Check out (plain git)
         run: |
-          git init -q . && git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q "${{ github.server_url }}/${{ github.repository }}" "${{ github.sha }}" && git checkout -q FETCH_HEAD
+          git init -q . && git config core.autocrlf false && git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q "${{ github.server_url }}/${{ github.repository }}" "${{ github.sha }}" && git checkout -q FETCH_HEAD
       - name: MegaLinter
         env:
           DEFAULT_WORKSPACE: ${{ github.workspace }}
           VALIDATE_ALL_CODEBASE: "true"
+          # Quiet by default (spelling, link checks, type checkers that need the project's
+          # dependencies installed, duplicate-code); a repo can re-enable them in .mega-linter.yml
+          DISABLE_LINTERS: SPELL_CSPELL,SPELL_LYCHEE,COPYPASTE_JSCPD,PYTHON_PYLINT,PYTHON_PYRIGHT,PYTHON_MYPY,PYTHON_FLAKE8,MARKDOWN_MARKDOWN_TABLE_FORMATTER,REPOSITORY_CHECKOV
+          PYTHON_BANDIT_ARGUMENTS: "-ll"   # medium and high severity only
           APPLY_FIXES: none
           DISABLE_ERRORS: "true"    # report only; set to "false" to fail the check on errors
           SHOW_ELAPSED_TIME: "true"
           FILEIO_REPORTER: "false"
-          MARKDOWN_SUMMARY_REPORTER: "true"
+          JSON_REPORTER: "true"          # read by the summary step
+          MARKDOWN_SUMMARY_REPORTER: "false"
         run: /entrypoint.sh
-      - name: Post the summary on the PR
-        if: github.event_name == 'pull_request'
+      - name: Post a readable summary on the PR (updates its own earlier comment)
+        if: always() && github.event_name == 'pull_request'
         env:
           TOKEN: ${{ github.token }}
-          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
+          curl -sf "${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main/lint_summary.py" -o /tmp/lint_summary.py
+          python3 /tmp/lint_summary.py > /tmp/summary.md || echo "MegaLinter produced no report; see the Actions log." > /tmp/summary.md
           python3 - <<'PY'
           import json, os, urllib.request
-          p = "megalinter-reports/megalinter-report.md"
-          body = open(p).read() if os.path.exists(p) else "MegaLinter produced no summary."
-          req = urllib.request.Request(os.environ["API"], json.dumps({"body": body[:60000]}).encode(),
-                                       {"Content-Type": "application/json", "Authorization": "token " + os.environ["TOKEN"]})
-          urllib.request.urlopen(req)
+          api, h = os.environ["API"], {"Content-Type": "application/json", "Authorization": "token " + os.environ["TOKEN"]}
+          body = "<!-- kk-lint -->\n" + open("/tmp/summary.md").read()[:60000]
+          call = lambda m, u, d=None: json.load(urllib.request.urlopen(urllib.request.Request(u, json.dumps(d).encode() if d else None, h, method=m)))
+          mine = [c for c in call("GET", f"{api}/issues/{os.environ['PR']}/comments") if c["body"].startswith("<!-- kk-lint -->")]
+          if mine:
+              call("PATCH", f"{api}/issues/comments/{mine[-1]['id']}", {"body": body})
+          else:
+              call("POST", f"{api}/issues/{os.environ['PR']}/comments", {"body": body})
           PY
