@@ -27,13 +27,16 @@ jobs:
           git init -q . && git remote add origin "${{ github.server_url }}/${{ github.repository }}"
           git config http.extraHeader "Authorization: token ${{ github.token }}"
           git fetch -q origin "${{ github.ref_name }}" && git checkout -q -B "$BRANCH" FETCH_HEAD
-          git config user.name "kompas-lint" && git config user.email "lint@kreative-kompas.com"
+          git config core.autocrlf false && git config user.name "kompas-lint" && git config user.email "lint@kreative-kompas.com"
           echo "megalinter-reports/" >> .git/info/exclude && echo "ai-fixes.json" >> .git/info/exclude
           curl -sf "$CI_RAW/lint_ai_fix.py" -o /tmp/lint_ai_fix.py && curl -sf "$CI_RAW/lint_fix_pr.py" -o /tmp/lint_fix_pr.py
       - name: MegaLinter with automatic fixes
         env:
           DEFAULT_WORKSPACE: ${{ github.workspace }}
           VALIDATE_ALL_CODEBASE: "true"
+          # Quiet by default (spelling, link checks, type checkers that need the project's
+          # dependencies installed, duplicate-code); a repo can re-enable them in .mega-linter.yml
+          DISABLE_LINTERS: SPELL_CSPELL,SPELL_LYCHEE,COPYPASTE_JSCPD,PYTHON_PYLINT,PYTHON_PYRIGHT,PYTHON_MYPY,PYTHON_FLAKE8,MARKDOWN_MARKDOWN_TABLE_FORMATTER,REPOSITORY_CHECKOV
           APPLY_FIXES: all
           DISABLE_ERRORS: "true"
           JSON_REPORTER: "true"
@@ -49,6 +52,9 @@ jobs:
         env:
           DEFAULT_WORKSPACE: ${{ github.workspace }}
           VALIDATE_ALL_CODEBASE: "true"
+          # Quiet by default (spelling, link checks, type checkers that need the project's
+          # dependencies installed, duplicate-code); a repo can re-enable them in .mega-linter.yml
+          DISABLE_LINTERS: SPELL_CSPELL,SPELL_LYCHEE,COPYPASTE_JSCPD,PYTHON_PYLINT,PYTHON_PYRIGHT,PYTHON_MYPY,PYTHON_FLAKE8,MARKDOWN_MARKDOWN_TABLE_FORMATTER,REPOSITORY_CHECKOV
           DISABLE_ERRORS: "true"
           JSON_REPORTER: "true"
           FILEIO_REPORTER: "false"
