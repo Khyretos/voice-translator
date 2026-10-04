@@ -1,17 +1,16 @@
-# Lint fixes by the linters and the local AI, as a pull request. Runs on soucouyant.
+# Nightly lint fixes as small pull requests. Runs on soucouyant.
 # Copy to .forgejo/workflows/lint-fix.yml; same flavour image as lint.yml.
-# 1. MegaLinter with APPLY_FIXES=all (formatters and --fix modes).
-# 2. Qwen 3.5 on soucouyant rewrites up to 5 files that still have errors
-#    (lint_ai_fix.py); a second MegaLinter pass keeps those edits only if the
-#    error count went down.
-# 3. Opens or updates the PR "lint-fix/auto" with a readable summary; kompas-review
-#    reviews it. Nothing is merged automatically.
+# Each night lint_nightly.py (khyretos/kompas-ci) picks ONE linter and up to 8 of its
+# files, runs the linter's own fix mode, then lets Qwen 3.5 on soucouyant fix the rest
+# file by file. A change is kept only when the error count of that language goes down.
+# Result: PR "lint-fix/<linter>". At most 3 such PRs wait at a time; after a merge the
+# next night continues. Nothing is merged automatically.
 name: lint-fix
 enable-email-notifications: true
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 3 * * 1"   # Mondays 03:30
+    - cron: "30 2 * * *"   # nightly 02:30
 
 jobs:
   fix:
@@ -22,64 +21,21 @@ jobs:
       # Ollama on soucouyant through the relay on kireserver (jobs can't reach their own host)
       OLLAMA_URL: http://192.168.178.103:11435/v1/chat/completions
       CI_RAW: ${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main
-      BRANCH: lint-fix/auto
+      DEFAULT_WORKSPACE: ${{ github.workspace }}
+      EXTENDS: ${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main/mega-linter.base.yml
+      CONFIG_PROPERTIES_TO_APPEND: DISABLE_LINTERS
+      TOKEN: ${{ github.token }}
+      API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+      BASE: ${{ github.ref_name }}
     steps:
       - name: Check out (plain git, push access)
         run: |
           git init -q . && git config core.autocrlf false   # the image sets autocrlf=true: whole-file CRLF diffs
           git remote add origin "${{ github.server_url }}/${{ github.repository }}"
           git config http.extraHeader "Authorization: token ${{ github.token }}"
-          git fetch -q origin "${{ github.ref_name }}" && git checkout -q -B "$BRANCH" FETCH_HEAD
+          git fetch -q origin "$BASE" && git checkout -q -B lint-fix-work FETCH_HEAD
           git config user.name "kompas-lint" && git config user.email "lint@kreative-kompas.com"
-          echo "megalinter-reports/" >> .git/info/exclude && echo "ai-fixes.json" >> .git/info/exclude
-          curl -sf "$CI_RAW/lint_ai_fix.py" -o /tmp/lint_ai_fix.py && curl -sf "$CI_RAW/lint_fix_pr.py" -o /tmp/lint_fix_pr.py && curl -sf "$CI_RAW/keep_eol.py" -o /tmp/keep_eol.py
-      - name: MegaLinter with automatic fixes
-        env:
-          DEFAULT_WORKSPACE: ${{ github.workspace }}
-          VALIDATE_ALL_CODEBASE: "true"
-          # Quiet by default (spelling, link checks, type checkers that need the project's
-          # dependencies installed, duplicate-code); a repo can re-enable them in .mega-linter.yml
-          DISABLE_LINTERS: SPELL_CSPELL,SPELL_LYCHEE,COPYPASTE_JSCPD,PYTHON_PYLINT,PYTHON_PYRIGHT,PYTHON_MYPY,PYTHON_FLAKE8,MARKDOWN_MARKDOWN_TABLE_FORMATTER,REPOSITORY_CHECKOV
-          PYTHON_BANDIT_ARGUMENTS: "-ll"   # medium and high severity only
-          APPLY_FIXES: all
-          DISABLE_ERRORS: "true"
-          JSON_REPORTER: "true"
-          FILEIO_REPORTER: "false"
-          MARKDOWN_SUMMARY_REPORTER: "false"
-        run: |
-          /entrypoint.sh
-          cp megalinter-reports/mega-linter-report.json /tmp/pass1.json
-          python3 /tmp/keep_eol.py; git add -A && git commit -q -m "Lint: automatic fixes by MegaLinter" || echo "no automatic fixes"
-      - name: Local AI fixes the rest
-        run: python3 /tmp/lint_ai_fix.py
-      - name: Check the AI edits with a second MegaLinter pass
-        env:
-          DEFAULT_WORKSPACE: ${{ github.workspace }}
-          VALIDATE_ALL_CODEBASE: "true"
-          # Quiet by default (spelling, link checks, type checkers that need the project's
-          # dependencies installed, duplicate-code); a repo can re-enable them in .mega-linter.yml
-          DISABLE_LINTERS: SPELL_CSPELL,SPELL_LYCHEE,COPYPASTE_JSCPD,PYTHON_PYLINT,PYTHON_PYRIGHT,PYTHON_MYPY,PYTHON_FLAKE8,MARKDOWN_MARKDOWN_TABLE_FORMATTER,REPOSITORY_CHECKOV
-          PYTHON_BANDIT_ARGUMENTS: "-ll"   # medium and high severity only
-          DISABLE_ERRORS: "true"
-          JSON_REPORTER: "true"
-          FILEIO_REPORTER: "false"
-          MARKDOWN_SUMMARY_REPORTER: "false"
-        run: |
-          if [ -z "$(git status --porcelain)" ]; then echo "KEPT_AI=no" >> "$GITHUB_ENV"; exit 0; fi
-          /entrypoint.sh
-          python3 - <<'PY'
-          import json, os
-          err = lambda p: sum(l.get("total_number_errors") or 0 for l in json.load(open(p)).get("linters", []))
-          keep = err("megalinter-reports/mega-linter-report.json") < err("/tmp/pass1.json")
-          open(os.environ["GITHUB_ENV"], "a").write(f"KEPT_AI={'yes' if keep else 'no'}\n")
-          PY
-          if grep -q "KEPT_AI=yes" "$GITHUB_ENV"; then python3 /tmp/keep_eol.py; git add -A && git commit -q -m "Lint: fixes by the local AI (Qwen 3.5)"; else git checkout -q -- . ; fi
-      - name: Push and open the pull request
-        env:
-          TOKEN: ${{ github.token }}
-          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
-          BASE: ${{ github.ref_name }}
-        run: |
-          if [ "$(git rev-list --count FETCH_HEAD..HEAD)" = 0 ]; then echo "Nothing to fix."; exit 0; fi
-          git push -q -f origin "$BRANCH"
-          python3 /tmp/lint_fix_pr.py
+          curl -sf "$CI_RAW/lint_setup.sh" | sh
+          for f in lint_nightly.py lint_ai_fix.py keep_eol.py; do curl -sf "$CI_RAW/$f" -o "/tmp/$f"; done
+      - name: Fix one linter and open a PR
+        run: python3 /tmp/lint_nightly.py
