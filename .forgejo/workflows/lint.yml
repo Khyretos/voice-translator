@@ -5,9 +5,10 @@
 #   most others), -go, -rust, or megalinter (everything, ~10 GB).
 # Results: one readable summary comment on the PR (updated on every push) plus the
 # full logs in the job. Scripts: public repo khyretos/kompas-ci (lint_summary.py).
-# Fine-tune with a .mega-linter.yml in the repo (DISABLE_LINTERS, rules files).
+# Shared settings and rule files: mega-linter.base.yml and linters/ in kompas-ci.
+# Fine-tune per repo with a .mega-linter.yml (its DISABLE_LINTERS adds to the shared list).
 name: lint
-enable-email-notifications: true   # branded mail when the check fails or recovers
+enable-email-notifications: true
 on:
   pull_request:
   push:
@@ -22,14 +23,13 @@ jobs:
       - name: Check out (plain git)
         run: |
           git init -q . && git config core.autocrlf false && git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q "${{ github.server_url }}/${{ github.repository }}" "${{ github.sha }}" && git checkout -q FETCH_HEAD
+          curl -sf "${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main/lint_setup.sh" | sh
       - name: MegaLinter
         env:
           DEFAULT_WORKSPACE: ${{ github.workspace }}
           VALIDATE_ALL_CODEBASE: "true"
-          # Quiet by default (spelling, link checks, type checkers that need the project's
-          # dependencies installed, duplicate-code); a repo can re-enable them in .mega-linter.yml
-          DISABLE_LINTERS: SPELL_CSPELL,SPELL_LYCHEE,COPYPASTE_JSCPD,PYTHON_PYLINT,PYTHON_PYRIGHT,PYTHON_MYPY,PYTHON_FLAKE8,MARKDOWN_MARKDOWN_TABLE_FORMATTER,REPOSITORY_CHECKOV
-          PYTHON_BANDIT_ARGUMENTS: "-ll"   # medium and high severity only
+          EXTENDS: ${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main/mega-linter.base.yml
+          CONFIG_PROPERTIES_TO_APPEND: DISABLE_LINTERS
           APPLY_FIXES: none
           DISABLE_ERRORS: "true"    # report only; set to "false" to fail the check on errors
           SHOW_ELAPSED_TIME: "true"
