@@ -1,0 +1,46 @@
+# MegaLinter (AGPL-3.0): ~100 linters and security scanners in one step, run on
+# soucouyant. Free alternative to SonarQube. Copy to .forgejo/workflows/lint.yml
+# and pick the flavour image for the repo's main language:
+#   megalinter-python, -javascript (TS/Angular/React), -java, -cupcake (C/C++ and
+#   most others), -go, -rust, or megalinter (everything, ~10 GB).
+# Results: a summary comment on the PR plus the full logs in the job.
+# Fine-tune with a .mega-linter.yml in the repo (DISABLE_LINTERS, rules files).
+name: lint
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  megalinter:
+    runs-on: soucouyant
+    container:
+      image: oxsecurity/megalinter-python:v9
+    steps:
+      - name: Check out (plain git)
+        run: |
+          git init -q . && git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q "${{ github.server_url }}/${{ github.repository }}" "${{ github.sha }}" && git checkout -q FETCH_HEAD
+      - name: MegaLinter
+        env:
+          DEFAULT_WORKSPACE: ${{ github.workspace }}
+          VALIDATE_ALL_CODEBASE: "true"
+          APPLY_FIXES: none
+          DISABLE_ERRORS: "true"    # report only; set to "false" to fail the check on errors
+          SHOW_ELAPSED_TIME: "true"
+          FILEIO_REPORTER: "false"
+          MARKDOWN_SUMMARY_REPORTER: "true"
+        run: /entrypoint.sh
+      - name: Post the summary on the PR
+        if: github.event_name == 'pull_request'
+        env:
+          TOKEN: ${{ github.token }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          p = "megalinter-reports/megalinter-report.md"
+          body = open(p).read() if os.path.exists(p) else "MegaLinter produced no summary."
+          req = urllib.request.Request(os.environ["API"], json.dumps({"body": body[:60000]}).encode(),
+                                       {"Content-Type": "application/json", "Authorization": "token " + os.environ["TOKEN"]})
+          urllib.request.urlopen(req)
+          PY
