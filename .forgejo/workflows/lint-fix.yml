@@ -18,9 +18,9 @@ jobs:
     runs-on: soucouyant
     container:
       image: oxsecurity/megalinter-python:v9
-      options: --network host   # the bridge network can't reach Ollama on the host (firewall)
     env:
-      OLLAMA_URL: http://192.168.178.80:11434/v1/chat/completions
+      # Ollama on soucouyant through the relay on kireserver (jobs can't reach their own host)
+      OLLAMA_URL: http://192.168.178.103:11435/v1/chat/completions
       CI_RAW: ${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main
       BRANCH: lint-fix/auto
     steps:
