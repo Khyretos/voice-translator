@@ -71,6 +71,7 @@ discord_bridge/      Node.js bot: follows a user, receives each speaker's
 actually running — they're plain Python (plus numpy/requests/starlette) — so
 I could `import` and exercise them directly in a real Python process here,
 not just read the code. Concretely:
+
 - Ran `python3 -m py_compile` on every module.
 - Ran `pyflakes` across the whole set — flags **undefined names**, not just
   style, so this is real evidence nothing references a symbol that no
@@ -93,6 +94,7 @@ pytest
 
 87 tests across 6 files, covering the concrete bugs fixed in earlier
 phases as regression tests — not just "does it run":
+
 - `test_vad.py` (10) — silence produces no segments, short bursts are
   dropped as noise, threshold/end-silence hot-reload.
 - `test_subtitles.py` (13) — the three subtitle-timing bugs fixed in

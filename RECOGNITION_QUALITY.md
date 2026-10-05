@@ -83,6 +83,7 @@ you." matches, but "Thanks for watching, don't forget to subscribe!" or
 the same underlying hallucination. Widened `is_whisper_hallucination()`
 with a conservative prefix check, split into two tiers so it can't eat real
 short sentences:
+
 - Generic openers ("thank you", "bye", "goodbye") only count for
   utterances of 4 words or fewer — real speech regularly starts this way
   and keeps going ("Thank you Bob, see you tomorrow..."), so anything
@@ -98,6 +99,7 @@ they're *not* caught — see `tests/test_recognizers.py`.
 ## If you're still seeing hallucinations after all of the above
 
 Try, in roughly this order of impact:
+
 1. **Raise `vad_threshold`** (in dB, e.g. from -30 to -20 or -15) if your
    environment has background noise/hum sitting close to the current
    threshold — this stops those sounds from ever being classified as
