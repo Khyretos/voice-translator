@@ -20,12 +20,14 @@ into a virtual input device on the host, then pick that device here. A
 couple of common ways to do that:
 
 - **Linux (PulseAudio/PipeWire), most common for a Docker host:**
+
   ```bash
   # Create a virtual sink, and a virtual mic that's fed by its monitor
   pactl load-module module-null-sink sink_name=discord_capture
   pactl load-module module-remap-source \
       master=discord_capture.monitor source_name=discord_mic
   ```
+
   Then set Discord's output device to `discord_capture`, and this app's
   input to `discord_mic` (it'll show up in the dropdown as a normal input
   device — no code change needed). This container already mounts

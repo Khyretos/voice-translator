@@ -95,6 +95,7 @@ session that's actively listening (`is_running`/`is_monitoring`), no matter
 how long it runs or how much silence there is — silence is handled by the
 VAD simply producing no segments, it never touches the session itself. The
 only things that stop a session:
+
 - You press Stop, or explicitly close it from the "Manage Sessions" panel.
 - An optional, **off-by-default** idle reaper that only ever considers
   *stopped* sessions (recognition already off) left completely untouched

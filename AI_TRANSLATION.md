@@ -27,7 +27,6 @@ whatever you need for a server that isn't shaped that way.
    happened to include the full working path) was silently 404ing. Fixed to
    `/v1`.
 
-
 ## Editable prompt
 
 `ai_translation_prompt_template` (Settings → Translation → AI, "Advanced").
@@ -52,6 +51,7 @@ different response shape), two more fields:
   tokens are substituted: `__MODEL__` and `__PROMPT__` (as JSON-escaped
   string *content*, no surrounding quotes — your template supplies those).
   Default:
+
   ```json
   {
     "model": "__MODEL__",
@@ -60,8 +60,10 @@ different response shape), two more fields:
     "max_tokens": 500
   }
   ```
+
   Point this at a completely different shape if needed, e.g. an
   Anthropic-style body:
+
   ```json
   {
     "model": "__MODEL__",
@@ -69,6 +71,7 @@ different response shape), two more fields:
     "messages": [{"role": "user", "content": "__PROMPT__"}]
   }
   ```
+
   If the substituted result isn't valid JSON, a warning is logged and the
   default shape is used instead — translation doesn't just break silently.
 

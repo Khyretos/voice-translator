@@ -20,10 +20,12 @@ ignore list if you don't want it).
 2. **Give the app the token.** Either paste it into **Bot token** in the
    Discord settings of the web page (saved with the session, like every other
    setting), or set it once for all sessions in `docker-compose.yml`:
+
    ```yaml
    environment:
      - DISCORD_BOT_TOKEN=your-token-here
    ```
+
    Don't share the token with anyone; it controls the bot.
 3. **Invite the bot to your server(s).** Press **🔍 Check bot**: it logs
    in, lists the servers the bot is in, and prints an invite link with the
