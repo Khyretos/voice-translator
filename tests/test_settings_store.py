@@ -5,7 +5,6 @@ import json
 import time
 
 import pytest
-
 import settings_store as ss
 
 
