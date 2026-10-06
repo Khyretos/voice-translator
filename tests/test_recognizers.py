@@ -2,7 +2,6 @@
 WhisperRecognizer's client-side confidence filtering (no network calls)."""
 
 import pytest
-
 from recognizers import (
     ArgosTranslator,
     WhisperRecognizer,

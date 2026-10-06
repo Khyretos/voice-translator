@@ -16,36 +16,31 @@ import gradio as gr
 import numpy as np
 import requests
 import sounddevice as sd
-import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from vosk import KaldiRecognizer, Model
-
-from logger import Logger
 import translators as tmod
-from translators import TranslationService
-
-# ── Recognizer / translation backends (see recognizers.py) ───────────────────
-from recognizers import (
-    ARGOS_AVAILABLE,
-    MOONSHINE_LANGUAGES,
-    ArgosTranslator,
-    MoonshineRecognizer,
-    WhisperRecognizer,
-    _MOONSHINE_AVAILABLE,
-    dots_or_stars,
-    is_whisper_hallucination,
-)
-from vad import FastVAD, _WRTCVAD_AVAILABLE
-from live_whisper import LiveWhisperWorker
+import uvicorn
 from audio_input import open_input_stream
 from discord_pipeline import DiscordPipeline
 from discord_source import bridge_available as discord_bridge_available
 from discord_source import check_bot as check_discord
 from discord_source import invite_url as discord_invite_url
-from subtitles import SpeakerBoard, SubtitleManager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from live_whisper import LiveWhisperWorker
+from logger import Logger
+
+# ── Recognizer / translation backends (see recognizers.py) ───────────────────
+from recognizers import (
+    _MOONSHINE_AVAILABLE,
+    ARGOS_AVAILABLE,
+    MOONSHINE_LANGUAGES,
+    ArgosTranslator,
+    MoonshineRecognizer,
+    WhisperRecognizer,
+    dots_or_stars,
+    is_whisper_hallucination,
+)
 from session import (
     SessionSlugMiddleware,
     get_slug,
@@ -57,6 +52,10 @@ from settings_store import (
     load_saved_settings,
     persist_settings,
 )
+from subtitles import SpeakerBoard, SubtitleManager
+from translators import TranslationService
+from vad import _WRTCVAD_AVAILABLE, FastVAD
+from vosk import KaldiRecognizer, Model
 
 if ARGOS_AVAILABLE:
     # Needed directly (not just via ArgosTranslator) for the Argos settings
