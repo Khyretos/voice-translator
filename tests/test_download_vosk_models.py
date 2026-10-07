@@ -6,6 +6,7 @@ of "vosk_models/"; a hardcoded, quickly-stale model list) plus the
 obsolete-string-vs-boolean footgun in the live catalog's own JSON shape.
 """
 
+import importlib.util
 import json
 import shutil
 import tempfile
@@ -13,10 +14,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
-
 from conftest import ROOT
-
-import importlib.util
 
 spec = importlib.util.spec_from_file_location(
     "download_vosk_models", ROOT / "download_vosk_models.py"

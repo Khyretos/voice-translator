@@ -8,6 +8,7 @@ import re
 import threading
 import time
 
+
 class SubtitleManager:
     """
     Buffers and paces subtitle display.

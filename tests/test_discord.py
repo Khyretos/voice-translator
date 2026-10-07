@@ -10,7 +10,6 @@ import wave
 
 import numpy as np
 import pytest
-
 from discord_source import (
     BRIDGE_DIR,
     DiscordBridge,

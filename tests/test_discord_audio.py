@@ -5,7 +5,6 @@ import shutil
 import subprocess
 
 import pytest
-
 from discord_source import BRIDGE_DIR
 
 pytestmark = pytest.mark.skipif(

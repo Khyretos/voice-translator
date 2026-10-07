@@ -17,7 +17,6 @@ import threading
 import time
 
 import numpy as np
-
 from discord_source import DiscordBridge, bridge_available, parse_id_list
 from live_whisper import LiveWhisperWorker
 
