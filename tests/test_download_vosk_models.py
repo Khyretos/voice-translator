@@ -6,7 +6,6 @@ of "vosk_models/"; a hardcoded, quickly-stale model list) plus the
 obsolete-string-vs-boolean footgun in the live catalog's own JSON shape.
 """
 
-import json
 import shutil
 import tempfile
 import zipfile
