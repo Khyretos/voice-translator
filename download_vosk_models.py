@@ -71,6 +71,13 @@ def show_progress(block_num, block_size, total_size):
     downloaded_mb = downloaded / (1024 * 1024)
     total_mb = total_size / (1024 * 1024)
 
+    if not sys.stdout.isatty():
+        prev = max(0, (block_num - 1) * block_size)
+        prev_percent = min(100, prev / total_size * 100) if total_size > 0 else 0
+        if int(percent // 10) != int(prev_percent // 10):
+            print(f"{percent:.0f}% ({downloaded_mb:.1f}/{total_mb:.1f} MB)")
+        return
+
     sys.stdout.write(
         f"\r[{bar}] {percent:.1f}% ({downloaded_mb:.1f}/{total_mb:.1f} MB)"
     )

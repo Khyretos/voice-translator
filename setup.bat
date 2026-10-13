@@ -29,6 +29,11 @@ if not errorlevel 1 (
     echo.
     echo [WARNING] Python %PYTHON_VERSION% detected. torch, onnxruntime and others have no wheels yet.
     echo           Install Python 3.12 ^(py -3.12 is used automatically when present^).
+    if not "%VT_FORCE_PYTHON%"=="1" (
+        echo [ERROR] Stopping: this Python has no wheels for the dependencies. Set VT_FORCE_PYTHON=1 to try anyway.
+        pause
+        exit /b 1
+    )
 )
 echo.
 
@@ -99,7 +104,6 @@ echo.
 
 REM Create directories
 echo Creating directories...
-if not exist "models" mkdir models
 if not exist "logs" mkdir logs
 echo [OK] Directories created
 echo.
@@ -107,24 +111,30 @@ echo.
 REM Check for models
 echo Checking for Vosk models...
 dir /b vosk_models 2>nul | findstr /r "." >nul
-if errorlevel 1 (
-    echo [WARNING] No models found in vosk_models\ directory
-    echo.
-    echo Would you like to download a small English model? ^(40 MB^)
-    choice /c yn /m "Download model? (y/n): "
-    if errorlevel 2 (
-        echo.
-        echo You can download models manually:
-        echo    python download_vosk_models.py --lang en-us --small
-        echo.
-        echo Or visit: https://alphacephei.com/vosk/models
-    ) else (
-        python download_vosk_models.py --lang en-us --small
-    )
-) else (
-    echo [OK] Models found:
-    dir /b vosk_models
-)
+if not errorlevel 1 goto models_found
+echo [WARNING] No models found in vosk_models\ directory
+echo.
+if /i "%VT_DOWNLOAD_MODEL%"=="y" goto download_model
+echo Would you like to download a small English model? ^(40 MB^)
+choice /c yn /t 30 /d n /m "Download model" 2>nul
+if errorlevel 255 goto no_console
+if errorlevel 2 goto skip_model
+:download_model
+python download_vosk_models.py --lang en-us --small
+goto after_models
+:no_console
+echo [INFO] No console, skipping model download.
+:skip_model
+echo.
+echo You can download models manually:
+echo    python download_vosk_models.py --lang en-us --small
+echo.
+echo Or visit: https://alphacephei.com/vosk/models
+goto after_models
+:models_found
+echo [OK] Models found:
+dir /b vosk_models
+:after_models
 echo.
 
 echo ========================================
