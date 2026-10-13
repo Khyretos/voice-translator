@@ -121,6 +121,7 @@ if errorlevel 255 goto no_console
 if errorlevel 2 goto skip_model
 :download_model
 python download_vosk_models.py --lang en-us --small
+if errorlevel 1 echo [WARNING] Model download failed. Retry later with: python download_vosk_models.py --lang en-us --small
 goto after_models
 :no_console
 echo [INFO] No console, skipping model download.
