@@ -11,7 +11,8 @@ sounddevice
 moonshine-voice                  # ONNX‑based local ASR (auto‑downloads models)
 
 # Audio & VAD
-webrtcvad                        # Voice Activity Detection (requires compiler)
+webrtcvad; sys_platform != "win32"   # Voice Activity Detection (needs a C compiler)
+webrtcvad-wheels; sys_platform == "win32"   # same module name, prebuilt Windows wheels
 cffi                             # Required by webrtcvad
 
 # Data & numeric processing

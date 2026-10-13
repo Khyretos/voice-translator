@@ -1,0 +1,32 @@
+[
+ {
+  "name": "vt-w1",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/setup.bat",
+  "check": "bash /tmp/kk-vt-chk/w1.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In setup.bat, inside the `if not errorlevel 1 (` block of `REM Warn about Python 3.13 and newer`, after the last `echo           Install Python 3.12 ...` line and before the closing `)`, add (4-space indent for the `if`):\n    if not \"%VT_FORCE_PYTHON%\"==\"1\" (\n        echo [ERROR] Stopping: this Python has no wheels for the dependencies. Set VT_FORCE_PYTHON=1 to try anyway.\n        pause\n        exit /b 1\n    )\nChange nothing else. One SEARCH/REPLACE block."
+ },
+ {
+  "name": "vt-w2",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/setup.bat",
+  "check": "bash /tmp/kk-vt-chk/w2.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In setup.bat delete the line `if not exist \"models\" mkdir models` (the unused models folder; the app uses vosk_models). Change nothing else. One SEARCH/REPLACE block."
+ },
+ {
+  "name": "vt-w4",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/download_vosk_models.py",
+  "check": "bash /tmp/kk-vt-chk/w4.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In download_vosk_models.py change `show_progress` so it also works when stdout is redirected to a file or pipe. When `sys.stdout.isatty()` is true keep the existing `\\r` progress bar exactly as it is. When it is false, instead print (with print(), ending in a newline, no `\\r`) one line like `{percent:.0f}% ({downloaded_mb:.1f}/{total_mb:.1f} MB)` only when the 10-percent step changed: compute `prev = max(0, (block_num - 1) * block_size)`, `prev_percent = min(100, prev / total_size * 100) if total_size > 0 else 0`, and print when `block_num == 0` or `int(percent // 10) != int(prev_percent // 10)`. Put the non-tty branch first with an early `return`, after the `percent`, `downloaded_mb` and `total_mb` values are computed. One SEARCH/REPLACE block."
+ }
+]
