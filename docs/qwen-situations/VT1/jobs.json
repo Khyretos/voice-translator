@@ -1,0 +1,82 @@
+[
+ {
+  "name": "vt-v1",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/requirements.txt",
+  "check": "bash /tmp/kk-vt-chk/v1.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In requirements.txt replace the two lines `webrtcvad                        # Voice Activity Detection (requires compiler)` and `cffi                             # Required by webrtcvad` with exactly these three lines:\nwebrtcvad; sys_platform != \"win32\"   # Voice Activity Detection (needs a C compiler)\nwebrtcvad-wheels; sys_platform == \"win32\"   # same module name, prebuilt Windows wheels\ncffi                             # Required by webrtcvad\nNo text before a `;` other than the package name. Change nothing else. One SEARCH/REPLACE block."
+ },
+ {
+  "name": "vt-v2a",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/setup.bat",
+  "check": "bash /tmp/kk-vt-chk/v2a.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In setup.bat replace these lines:\nREM Check Python\necho Checking Python installation...\npython --version >nul 2>&1\nwith:\nREM Check Python (prefer 3.12: torch, onnxruntime etc. have no wheels for newer versions)\necho Checking Python installation...\nset \"PY=python\"\npy -3.12 --version >nul 2>&1\nif not errorlevel 1 set \"PY=py -3.12\"\n%PY% --version >nul 2>&1\nChange nothing else. One SEARCH/REPLACE block."
+ },
+ {
+  "name": "vt-v2b",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/setup.bat",
+  "check": "bash /tmp/kk-vt-chk/v2b.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In setup.bat the line `for /f \"tokens=2\" %%i in ('python --version 2^>^&1') do set PYTHON_VERSION=%%i` must call `%PY%` instead of `python`: replace `'python --version 2^>^&1'` with `'%PY% --version 2^>^&1'`. Change nothing else. One SEARCH/REPLACE block; SEARCH only that for line."
+ },
+ {
+  "name": "vt-v2c",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/setup.bat",
+  "check": "bash /tmp/kk-vt-chk/v2c.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In setup.bat replace the line `    python -m venv venv` with `    %PY% -m venv venv`. Change nothing else. One SEARCH/REPLACE block."
+ },
+ {
+  "name": "vt-v2d",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/setup.bat",
+  "check": "bash /tmp/kk-vt-chk/v2d.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In setup.bat replace the block that starts with `REM Warn about Python 3.14` and ends with its closing `)` (the one printing `[WARNING] Python 3.14 detected.`) by:\nREM Warn about Python 3.13 and newer\necho %PYTHON_VERSION% | findstr /R /C:\"^3\\.1[3-9]\" >nul\nif not errorlevel 1 (\n    echo.\n    echo [WARNING] Python %PYTHON_VERSION% detected. torch, onnxruntime and others have no wheels yet.\n    echo           Install Python 3.12 ^(py -3.12 is used automatically when present^).\n)\nChange nothing else. One SEARCH/REPLACE block."
+ },
+ {
+  "name": "vt-v3",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/setup.bat",
+  "check": "bash /tmp/kk-vt-chk/v3.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In setup.bat rewrite the pip section from `echo Installing core dependencies...` up to the line `echo [OK] Dependencies installed` plus the blank `echo.` after it. New logic: `set \"PIP_FAILED=0\"`; `pip install -r requirements.txt`; on `if errorlevel 1 (` print the existing [WARNING] and then install one by one: vosk, sounddevice, \"numpy<2.0\", requests, translators, \"gradio>=4.44.0\", argostranslate, websockets, moonshine-voice, tokenizers, huggingface_hub, and `pip install webrtcvad-wheels` (each line `pip install X` followed by `if errorlevel 1 set \"PIP_FAILED=1\"`). After that block: `if \"%PIP_FAILED%\"==\"1\" (` print `[ERROR] Dependencies could not be installed. See the pip output above.`, `pause`, `exit /b 1` `)`; then `echo [OK] Dependencies installed` and `echo.`. The [OK] line must be reached only when nothing failed. Note: when requirements.txt itself installs fine, PIP_FAILED stays 0. One SEARCH/REPLACE block."
+ },
+ {
+  "name": "vt-v4",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/setup.bat",
+  "check": "bash /tmp/kk-vt-chk/v4.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In setup.bat rewrite the `REM Check for models` block (from `REM Check for models` up to, not including, the line `echo ========================================` before `echo Setup complete!`). Facts: models live in the `vosk_models` folder (not `models`), the downloader is `download_vosk_models.py` (use `python download_vosk_models.py --lang en-us --small`). Rules for cmd: every `(` and `)` inside an echo line must be written `^(` and `^)`; do not use `set /p` or `%choice%` \u2014 use `choice /c yn /m \"Download a small English model ^(40 MB^)?\"` and then `if errorlevel 2 (` ... `) else (` ... `)` where errorlevel 2 means No. Also create the vosk_models folder check: `dir /b vosk_models 2>nul | findstr /r \".\" >nul`. Messages: no models -> [WARNING], ask; yes -> download command; no -> tell the user the manual command `python download_vosk_models.py --lang en-us --small` and the URL https://alphacephei.com/vosk/models; models found -> `[OK] Models found:` and `dir /b vosk_models`. One SEARCH/REPLACE block."
+ },
+ {
+  "name": "vt-v6",
+  "role": "worker/web",
+  "mode": "patch",
+  "out": "/home/khyretos/Docker/Personal-projects/kk-wt-nbwin/vt/start.bat",
+  "check": "bash /tmp/kk-vt-chk/v6.sh",
+  "precheck": false,
+  "context": [],
+  "prompt": "In start.bat replace the line `python voice_translator.py` with `python voice_translator.py --host 127.0.0.1` so Windows does not show a firewall prompt (the app's default 0.0.0.0 stays for Docker). Change nothing else. One SEARCH/REPLACE block."
+ }
+]
