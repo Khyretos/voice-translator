@@ -1,4 +1,4 @@
-# Nightly lint fixes as small pull requests. Runs on soucouyant.
+# Nightly lint fixes as small pull requests. Runs on kompas-builder or windows-wsl.
 # Copy to .forgejo/workflows/lint-fix.yml; same flavour image as lint.yml.
 # Each night lint_nightly.py (khyretos/kompas-ci) picks ONE linter and up to 8 of its
 # files, runs the linter's own fix mode, then lets Qwen 3.5 on soucouyant fix the rest
@@ -15,11 +15,11 @@ on:
 
 jobs:
   fix:
-    runs-on: soucouyant
+    runs-on: ubuntu-latest
     container:
       image: oxsecurity/megalinter-python:v9
     env:
-      # Ollama on soucouyant through the relay on kireserver (jobs can't reach their own host)
+      # Ollama on soucouyant through the relay on kireserver (a LAN address, so either runner reaches it)
       OLLAMA_URL: http://192.168.178.103:11435/v1/chat/completions
       CI_RAW: ${{ github.server_url }}/khyretos/kompas-ci/raw/branch/main
       DEFAULT_WORKSPACE: ${{ github.workspace }}

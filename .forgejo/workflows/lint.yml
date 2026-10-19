@@ -16,7 +16,7 @@ on:
 
 jobs:
   megalinter:
-    runs-on: soucouyant
+    runs-on: ubuntu-latest
     container:
       image: oxsecurity/megalinter-python:v9
     steps:
