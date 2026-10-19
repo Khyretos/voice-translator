@@ -1,4 +1,4 @@
-# Nightly lint fixes as small pull requests. Runs on kireserver or soucouyant (not the Windows PC: small disk).
+# Nightly lint fixes as small pull requests. Runs on kireserver (not soucouyant or the Windows PC).
 # Copy to .forgejo/workflows/lint-fix.yml; same flavour image as lint.yml.
 # Each night lint_nightly.py (khyretos/kompas-ci) picks ONE linter and up to 8 of its
 # files, runs the linter's own fix mode, then lets Qwen 3.5 on soucouyant fix the rest
@@ -15,7 +15,7 @@ on:
 
 jobs:
   fix:
-    runs-on: ubuntu-24.04 # MegaLinter images are big: kireserver and soucouyant only, not the Windows PC (small disk)
+    runs-on: kireserver # MegaLinter images are big: kireserver only (soucouyant is Kees's daily PC, the Windows PC has a small disk)
     container:
       image: oxsecurity/megalinter-python:v9
     env:

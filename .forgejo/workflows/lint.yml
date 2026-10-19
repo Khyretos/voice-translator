@@ -16,7 +16,7 @@ on:
 
 jobs:
   megalinter:
-    runs-on: ubuntu-24.04 # MegaLinter images are big: kireserver and soucouyant only, not the Windows PC (small disk)
+    runs-on: kireserver # MegaLinter images are big: kireserver only (soucouyant is Kees's daily PC, the Windows PC has a small disk)
     container:
       image: oxsecurity/megalinter-python:v9
     steps:
