@@ -63,7 +63,7 @@
 
 ### Docker audio issues
 
-- Make sure the container has access to the host's sound devices:
+- Make sure the container has access to the host's sound devices (in `docker-compose.override.yml`, see the example):
 
   ```yaml
   devices:

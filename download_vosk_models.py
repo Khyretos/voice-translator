@@ -15,6 +15,9 @@ Usage:
     python download_vosk_models.py --lang es --small        # convenience: download the
                                                               # current (non-obsolete) small
                                                               # model for a language
+    python download_vosk_models.py --if-empty vosk-model-small-en-us-0.15
+                                                            # only when no model is installed
+                                                            # yet (the container's first start)
 """
 
 import argparse
@@ -150,6 +153,23 @@ def download_model(entry: dict, models_dir: Path) -> bool:
             temp_dir.rmdir()
 
 
+MODEL_MARKERS = ("am", "conf", "graph", "ivector", "rescore")
+
+
+def has_model(models_dir: Path) -> bool:
+    """True when models_dir already holds a real Vosk model: a folder with one of the
+    known subfolders, the same test as voice_translator.get_available_models."""
+    if not models_dir.is_dir():
+        return False
+    return any(
+        item.is_dir()
+        and not item.name.startswith(".")
+        and item.name != "temp"
+        and any((item / m).exists() for m in MODEL_MARKERS)
+        for item in models_dir.iterdir()
+    )
+
+
 def print_catalog(catalog: list[dict], lang_filter: str | None, show_obsolete: bool):
     entries = [e for e in catalog if show_obsolete or not is_obsolete(e)]
     if lang_filter:
@@ -204,7 +224,17 @@ Examples:
         help="With --lang: download the current (non-obsolete) small model "
         "for that language, without needing to know its exact name",
     )
+    parser.add_argument(
+        "--if-empty",
+        action="store_true",
+        help="Do nothing when a model is already installed (the container runs this on every "
+        "start, so the first start gets a default model and later starts skip the download)",
+    )
     args = parser.parse_args()
+
+    if args.if_empty and has_model(MODELS_DIR):
+        print(f"✓ A Vosk model is already in {MODELS_DIR}/: nothing to download")
+        return
 
     print("=" * 60)
     print("  Vosk Model Downloader")
@@ -257,6 +287,8 @@ Examples:
 
     print(f"✨ Downloaded {success_count}/{len(args.names)} model(s) successfully")
     print(f"📁 Models directory: {MODELS_DIR.absolute()}")
+    if success_count < len(args.names):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

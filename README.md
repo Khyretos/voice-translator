@@ -200,57 +200,40 @@ See `requirements.txt` for the full, current list (gradio, vosk, sounddevice, mo
 
 ### Method 2: Docker Deployment
 
-1. Build the Docker image
+You need Docker with Compose. Nothing else.
 
-   ```bash
-   docker compose build
-   ```
+```bash
+git clone https://git.kreative-kompas.com/khyretos/voice-translator.git
+cd voice-translator
+docker compose up -d --build
+```
 
-2. Place Vosk models in `./vosk_models/` (created automatically if missing)
+Open `http://<this computer>:7860`. That is the whole install: the first start downloads a small
+English Vosk model into `./vosk_models/` (pick another with `VOSK_DEFAULT_MODEL` in `.env`, or add
+more with `docker compose run --rm voice-translator python download_vosk_models.py --list`);
+Moonshine and Whisper fetch their own models.
 
-3. Start the container
+Optional, in files next to `docker-compose.yml`:
 
-   ```bash
-   docker compose up -d
-   ```
+- `.env` (see `.env.example`): port, default Vosk model, idle-session timeout, Discord bot token.
+- `docker-compose.override.yml` (see `docker-compose.override.example.yml`): a sound card
+  (`/dev/snd`, Linux hosts) for the "Microphone" source, a reverse proxy's network, a fixed
+  container name. Without a sound card, use the browser microphone or browser tab audio.
 
-4. Access the application at `http://localhost:7860`
+Behind a reverse proxy: forward your domain to port 7860 (websockets on) and set
+`VT_PORT=127.0.0.1:7860`.
+
+Update: `git pull && docker compose up -d --build` (the Python files are baked into the image,
+so a restart alone doesn't pick them up).
 
 ### Docker – Additional Notes
 
 - **Building the image** requires internet access to download `gcc` and Python headers inside the container; these build tools are removed again afterward to keep the image slim.
-- **Audio access** on Linux requires the `--device /dev/snd` flag (already in `docker-compose.yml`). On macOS/Windows, Docker Desktop may have limited audio support; use browser audio mode instead.
+- **Audio access** on Linux: add `/dev/snd` in `docker-compose.override.yml` (see the example). On macOS/Windows, Docker Desktop has no `/dev/snd`; use browser audio mode instead.
 - **Moonshine (local ONNX model)** is included in `requirements.txt` by default now.
-- **Volume mounts** – the compose file mounts `./vosk_models`, `./argos_models`, `./moonshine_models`, `./fonts`, `./logs`, and **`./settings`** (this last one is important — it's where every named session's settings actually live; without it, all settings are lost on every container restart). Create these directories on your host before starting the container, or let Compose create them automatically.
-- **Sessions are permanent by default** — silence never stops a session, however long it lasts. Recognition only stops by itself when the audio source is actually gone (see *Auto-stop when audio is lost* in the Audio settings). `IDLE_SESSION_TIMEOUT_SECONDS` in `docker-compose.yml` is opt-in (off by default, `0`) and even when set only ever considers *stopped* sessions left idle, never a running one. See [SESSIONS.md](./SESSIONS.md).
-- **Discord support** — the image also contains Node.js and the Discord bridge's packages (a separate build stage). A bot token can go in `DISCORD_BOT_TOKEN`, or per session in the UI. See [DISCORD.md](./DISCORD.md).
-- **Updating** — copy the files over as-is (all `.py` files plus the `discord_bridge/` folder without `node_modules`) and rebuild with `docker compose up -d --build`; the Python files are baked into the image, so a restart alone doesn't pick them up.
-
-### `docker-compose.yml`
-
-The file in this repo is the source of truth — it includes the settings volume and session-timeout env var described above. A trimmed example:
-
-```yaml
-services:
-  voice-translator:
-    build: .
-    container_name: voice-translator
-    volumes:
-      - ./vosk_models:/app/vosk_models
-      - ./argos_models:/app/argos_models
-      - ./moonshine_models:/app/moonshine_models
-      - ./fonts:/app/fonts
-      - ./logs:/app/logs
-      - ./settings:/app/settings # per-session settings — required for persistence across restarts
-    devices:
-      - /dev/snd:/dev/snd
-    environment:
-      - GRADIO_SERVER_NAME=0.0.0.0
-      - GRADIO_SERVER_PORT=7860
-      # - IDLE_SESSION_TIMEOUT_SECONDS=21600  # opt-in; 0/unset = never auto-close
-      # - DISCORD_BOT_TOKEN=                   # optional; see DISCORD.md
-    restart: unless-stopped
-```
+- **Folders** – `./vosk_models`, `./argos_models`, `./moonshine_models`, `./fonts`, `./logs` and **`./settings`** (where every named session's settings live) are created next to `docker-compose.yml` on the first start and kept across rebuilds.
+- **Sessions are permanent by default** — silence never stops a session, however long it lasts. Recognition only stops by itself when the audio source is actually gone (see *Auto-stop when audio is lost* in the Audio settings). `IDLE_SESSION_TIMEOUT_SECONDS` in `.env` is opt-in (off by default, `0`) and even when set only ever considers *stopped* sessions left idle, never a running one. See [SESSIONS.md](./SESSIONS.md).
+- **Discord support** — the image also contains Node.js and the Discord bridge's packages (a separate build stage). A bot token can go in `DISCORD_BOT_TOKEN` in `.env`, or per session in the UI. See [DISCORD.md](./DISCORD.md).
 
 ## 🎮 Usage
 
@@ -361,7 +344,7 @@ Each session gets a random pop‑out ID the first time it's created. Enter a cus
 
 ### 🐳 Docker Audio Passthrough
 
-- **Linux**: Hardware microphone works via `/dev/snd` passthrough (already configured in `docker-compose.yml`).
+- **Linux**: Hardware microphone works via `/dev/snd` passthrough (add it in `docker-compose.override.yml`, see the example).
 - **macOS / Windows**: Docker Desktop does not support `/dev/snd`. Use **browser microphone** or **browser tab/system audio** mode instead – both work without host sound device access.
 
 ### 🤖 Whisper Advanced Parameters
@@ -481,6 +464,7 @@ routes) isn't part of the automated suite.
 
 - `GRADIO_SERVER_NAME` – set to `0.0.0.0` inside container
 - `GRADIO_SERVER_PORT` – default `7860`
+- `VOSK_DEFAULT_MODEL` – Vosk model the first start downloads when `vosk_models/` is empty (default `vosk-model-small-en-us-0.15`; empty: none)
 - `IDLE_SESSION_TIMEOUT_SECONDS` – opt-in auto-close for **stopped** sessions left idle this many seconds; `0`/unset (default) disables it entirely. Never affects an actively-listening session regardless of this setting. See [SESSIONS.md](./SESSIONS.md).
 
 ## 📊 Logging
