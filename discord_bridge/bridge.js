@@ -62,10 +62,10 @@ function log(...args) {
 
 const { Downsampler, createOpusDecoder } = require('./audio');
 
-// Human-readable warnings for the app's log (stderr lines are debug-level).
-function warn(message) {
+// Messages for the app's log (plain stderr lines only show at debug level).
+function warn(message, level = 'warning') {
   log(message);
-  send({ type: 'log', level: 'warning', message });
+  send({ type: 'log', level, message });
 }
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
@@ -150,7 +150,9 @@ async function runFake(wavPath) {
       sendAudio(s.id, s.ds.push(toStereo(chunk)));
     });
   }, 20);
+  const hb = setInterval(() => send({ type: 'heartbeat', connected: true, channel: 'general' }), 10000);
   cleanups.push(() => clearInterval(timer));
+  cleanups.push(() => clearInterval(hb));
 }
 
 // ── real Discord ────────────────────────────────────────────────────────────
@@ -191,6 +193,13 @@ async function runDiscord() {
   const health = { badSince: 0, bad: 0, lastGood: Date.now(), lastRejoin: 0 };
   let leavingOnPurpose = false; // our own destroy() → ignore the bot's "left" event
   const errorLogAt = new Map(); // userId -> last time a decode error was logged
+
+  // Counters for the heartbeat / the app's periodic status line.
+  const stats = { decoded: 0, decryptFailures: 0, activeMs: 0, refreshes: 0 };
+  let lastPacketAt = Date.now(); // last time anyone (not ignored) was sending audio
+  let activeSinceGood = 0; // ms of incoming audio since the last decodable frame
+  let lastRefresh = 0;
+  const debugLogAt = new Map();
 
   async function announceSpeaker(guild, userId) {
     if (announced.has(userId)) return;
@@ -238,6 +247,8 @@ async function runDiscord() {
       health.lastGood = Date.now();
       health.bad = 0;
       health.badSince = 0;
+      activeSinceGood = 0;
+      stats.decoded++;
       if (ignore.has(userId)) return;
       const out = ds.push(pcm);
       if (out.length) sendAudio(userId, out);
@@ -284,6 +295,95 @@ async function runDiscord() {
     send({ type: 'voice', state: 'left', reason });
   }
 
+  // ── self-healing ───────────────────────────────────────────────────────
+  // Audio can stop without any error: when the end-to-end encryption session
+  // gets stuck mid key-change, @discordjs/voice silently *drops* every packet
+  // (its diagnostics are off unless debug is enabled). So rather than wait
+  // for errors, watch whether audio that is arriving actually comes out
+  // decoded, and whether audio arrives at all.
+  function othersInChannel() {
+    const channel = currentGuild && currentGuild.channels.cache.get(currentChannelId);
+    if (!channel || !channel.members) return false;
+    return channel.members.some(m => !m.user.bot && !ignore.has(m.id));
+  }
+
+  async function refresh(why, level = 'warning') {
+    const now = Date.now();
+    if (!connection || now - lastRefresh < 20000) return;
+    lastRefresh = now;
+    stats.refreshes++;
+    activeSinceGood = 0;
+    warn(`Discord: ${why} — refreshing the voice connection`, level);
+    for (const id of [...subscriptions.keys()]) unsubscribe(id);
+    const conn = connection;
+    try {
+      // New voice server connection + fresh encryption session, without
+      // leaving the channel (so no leave/join sound for anyone).
+      conn.configureNetworking();
+      await entersState(conn, VoiceConnectionStatus.Ready, 15000);
+      health.lastGood = Date.now();
+      lastPacketAt = Date.now();
+      log('voice connection refreshed');
+    } catch (e) {
+      if (connection === conn) {
+        health.lastRejoin = 0;
+        await rejoinFresh(`${why}; the refresh didn't work`);
+      }
+    }
+  }
+
+  setInterval(() => {
+    if (!connection || connection.state.status !== VoiceConnectionStatus.Ready) return;
+    const now = Date.now();
+    let sending = false;
+    for (const id of connection.receiver.speaking.users.keys()) {
+      if (!ignore.has(id) && id !== client.user.id) { sending = true; break; }
+    }
+    if (sending) {
+      lastPacketAt = now;
+      stats.activeMs += 500;
+      if (now - health.lastGood > 1000) activeSinceGood += 500;
+    }
+    if (activeSinceGood >= 5000) {
+      refresh('audio is arriving but can\'t be decrypted');
+    } else if (now - lastPacketAt > 120000 && now - lastRefresh > 600000 && othersInChannel()) {
+      // Nobody heard for 2 minutes although people are in the channel:
+      // possibly a dead connection. A refresh is invisible to users.
+      refresh('no audio received for 2 minutes', 'info');
+    }
+  }, 500);
+
+  setInterval(() => {
+    send({
+      type: 'heartbeat',
+      connected: Boolean(connection && connection.state.status === VoiceConnectionStatus.Ready),
+      channel: currentGuild && currentGuild.channels.cache.get(currentChannelId)
+        ? currentGuild.channels.cache.get(currentChannelId).name : null,
+      decoded: stats.decoded,
+      decrypt_failures: stats.decryptFailures,
+      active_s: stats.activeMs / 1000,
+      refreshes: stats.refreshes,
+      subscriptions: subscriptions.size,
+    });
+    stats.decoded = 0;
+    stats.decryptFailures = 0;
+    stats.activeMs = 0;
+    stats.refreshes = 0;
+  }, 10000);
+
+  function onVoiceDebug(msg) {
+    if (/Failed to decrypt/.test(msg)) {
+      stats.decryptFailures++;
+      return;
+    }
+    if (!/dave|mls|transition|invalid|close|reconnect|resum|error/i.test(msg)) return;
+    const key = msg.slice(0, 40);
+    const now = Date.now();
+    if (now - (debugLogAt.get(key) || 0) < 30000) return;
+    debugLogAt.set(key, now);
+    log('voice:', msg);
+  }
+
   async function join(channel, force = false) {
     if (!force && currentChannelId === channel.id && connection) return;
     for (const id of [...subscriptions.keys()]) unsubscribe(id);
@@ -305,10 +405,11 @@ async function runDiscord() {
       adapterCreator: channel.guild.voiceAdapterCreator,
       selfDeaf: false, // must hear to transcribe
       selfMute: true,
+      debug: true, // needed to see encryption (DAVE) problems at all; filtered in onVoiceDebug
     });
     connection = conn;
     conn.on('error', err => log('voice connection error:', err.message));
-    conn.on('debug', msg => { if (/dave/i.test(msg)) log('voice:', msg); });
+    conn.on('debug', onVoiceDebug);
     try {
       await entersState(conn, VoiceConnectionStatus.Ready, 20000);
     } catch (e) {
@@ -321,6 +422,8 @@ async function runDiscord() {
     if (connection !== conn) return;
     leavingOnPurpose = false;
     health.lastGood = Date.now();
+    lastPacketAt = Date.now();
+    activeSinceGood = 0;
     send({ type: 'voice', state: 'joined', guild: channel.guild.name, channel: channel.name });
     conn.receiver.speaking.on('start', userId => {
       if (connection === conn) subscribe(channel.guild, userId);

@@ -26,6 +26,11 @@ from live_whisper import LiveWhisperWorker
 # no packets from a speaker, feed their VAD enough silence to close it.
 _SPEAKER_IDLE_S = 0.25
 _JOIN_TIMEOUT_S = 35.0
+# The bridge sends a heartbeat every 10 s. None for this long = it's frozen
+# or gone, so it's restarted (without stopping the session).
+_HEARTBEAT_TIMEOUT_S = 45.0
+_RESTART_MIN_INTERVAL_S = 60.0
+_STATUS_INTERVAL_S = 300.0  # periodic "is it still working" line in the log
 
 
 class _Speaker:
@@ -50,6 +55,20 @@ class DiscordPipeline:
         self.channel_desc = ""
         self._stopping = False
         self._last_tick = 0.0
+        self._fake_wav: str | None = None
+        self._gen = 0  # bumped per bridge process; events from old ones are ignored
+        self._last_heartbeat = time.monotonic()
+        self._last_restart = 0.0
+        self._restarting = False
+        self._last_status = time.monotonic()
+        self._stats = self._new_stats()
+
+    @staticmethod
+    def _new_stats() -> dict:
+        return {
+            "speech_s": 0.0, "speakers": set(), "decoded": 0,
+            "decrypt_failures": 0, "refreshes": 0, "connected": None, "channel": None,
+        }
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self, fake_wav: str | None = None) -> tuple[bool, str]:
@@ -63,21 +82,82 @@ class DiscordPipeline:
             return False, "❌ Discord: set the bot token first (Audio → Discord)"
         if not follow.isdigit() and not fake_wav:
             return False, "❌ Discord: enter your Discord user ID (numbers only)"
-        self.bridge = DiscordBridge(
-            token,
-            follow,
-            parse_id_list(s.get("discord_ignore_ids", "")),
-            on_event=self._on_event,
-            on_audio=self._on_audio,
-            on_exit=self._on_exit,
-            logger=self.app.logger,
-            fake_wav=fake_wav,
-        )
+        self._fake_wav = fake_wav
+        self._spawn(token, follow)
         if not self._joined.wait(_JOIN_TIMEOUT_S) and not self._start_error:
             self._start_error = "timed out connecting to Discord"
         if self._start_error:
             return False, f"❌ Discord: {self._start_error}"
         return True, f"✅ Listening to Discord: {self.channel_desc}"
+
+    def _spawn(self, token: str, follow: str):
+        self._gen += 1
+        gen = self._gen
+        self._joined.clear()
+        self._start_error = None
+        self._last_heartbeat = time.monotonic()
+        self.bridge = DiscordBridge(
+            token,
+            follow,
+            parse_id_list(self.app.settings.get("discord_ignore_ids", "")),
+            on_event=lambda ev: self._on_event(ev) if gen == self._gen else None,
+            on_audio=lambda uid, pcm: self._on_audio(uid, pcm) if gen == self._gen else None,
+            on_exit=lambda code: self._on_exit(code) if gen == self._gen else None,
+            logger=self.app.logger,
+            fake_wav=self._fake_wav,
+        )
+
+    def restart_bridge(self, why: str):
+        """Replace a frozen/crashed bridge without stopping the session."""
+        now = time.monotonic()
+        if self._stopping or self._restarting or now - self._last_restart < _RESTART_MIN_INTERVAL_S:
+            return
+        self._restarting = True
+        self._last_restart = now
+        threading.Thread(target=self._do_restart, args=(why,), daemon=True).start()
+
+    def _do_restart(self, why: str):
+        log = self.app.logger.log
+        try:
+            log(f"Discord: {why} — restarting the Discord connection", level="warning")
+            old = self.bridge
+            s = self.app.settings
+            token = (s.get("discord_bot_token") or "").strip() or _env_token()
+            follow = (s.get("discord_user_id") or "").strip()
+            self._spawn(token, follow)  # new generation: the old one's exit is ignored
+            if old is not None:
+                old.stop(timeout=3)
+            if not self._joined.wait(_JOIN_TIMEOUT_S) or self._start_error:
+                self._stop_session(
+                    f"🔌 Discord: couldn't reconnect ({self._start_error or 'timed out'}) "
+                    f"— session stopped"
+                )
+            else:
+                log(f"Discord: reconnected to {self.channel_desc}", level="success")
+        finally:
+            self._restarting = False
+
+    def check_health(self):
+        """Called about once a second by the app's watchdog."""
+        if self._stopping or not self._joined.is_set():
+            return
+        now = time.monotonic()
+        if self.bridge is not None and not self.bridge.alive:
+            self.restart_bridge("the Discord bridge exited unexpectedly")
+        elif now - self._last_heartbeat > _HEARTBEAT_TIMEOUT_S:
+            self.restart_bridge("the Discord bridge stopped responding")
+        if now - self._last_status >= _STATUS_INTERVAL_S:
+            self._last_status = now
+            st, self._stats = self._stats, self._new_stats()
+            where = f"#{st['channel']}" if st["channel"] else self.channel_desc
+            state = "connected" if st["connected"] is not False else "NOT connected"
+            self.app.logger.log(
+                f"Discord status: {state} to {where} — last 5 min: "
+                f"{st['speech_s']:.0f}s of speech from {len(st['speakers'])} speaker(s), "
+                f"{st['decoded']} audio frames decoded, {st['decrypt_failures']} decrypt "
+                f"failures, {st['refreshes']} connection refreshes",
+                level="info",
+            )
 
     def stop(self):
         self._stopping = True
@@ -117,6 +197,15 @@ class DiscordPipeline:
     def _on_event(self, ev: dict):
         kind = ev.get("type")
         log = self.app.logger.log
+        if kind == "heartbeat":
+            self._last_heartbeat = time.monotonic()
+            st = self._stats
+            st["decoded"] += int(ev.get("decoded") or 0)
+            st["decrypt_failures"] += int(ev.get("decrypt_failures") or 0)
+            st["refreshes"] += int(ev.get("refreshes") or 0)
+            st["connected"] = bool(ev.get("connected"))
+            st["channel"] = ev.get("channel") or st["channel"]
+            return
         if kind == "ready":
             log(f"Discord: logged in as {ev.get('bot')}", level="info")
         elif kind == "voice":
@@ -152,6 +241,8 @@ class DiscordPipeline:
                 self._joined.set()
 
     def _on_audio(self, uid: str, pcm: bytes):
+        self._stats["speech_s"] += len(pcm) / 32000
+        self._stats["speakers"].add(uid)
         if self.app.is_running:
             self.app.audio_queue.put(("discord", uid, pcm))
 
@@ -160,7 +251,8 @@ class DiscordPipeline:
             self._start_error = self._start_error or "the Discord bridge exited"
             self._joined.set()
         elif self.app.is_running:
-            self._stop_session("🔌 Discord connection closed — session stopped")
+            # Crashed mid-session: reconnect rather than give up.
+            self.restart_bridge(f"the Discord bridge exited (code {code})")
 
     # ── audio (app processing thread) ────────────────────────────────────────
     def _speaker(self, uid: str) -> _Speaker:
@@ -218,10 +310,17 @@ class DiscordPipeline:
             speakers = list(self.speakers.values())
         silence_ms = int(self.app.settings.get("vad_end_silence_ms", 300)) + 100
         silence = b"\x00\x00" * (16 * silence_ms)
+        quiet = True
         for sp in speakers:
             if not sp.flushed and now - sp.last_audio > _SPEAKER_IDLE_S:
                 sp.flushed = True
                 self._feed(sp, silence)
+            if now - sp.last_audio <= _SPEAKER_IDLE_S:
+                quiet = False
+        if quiet:
+            # Discord sends nothing while nobody talks; show silence on the
+            # level meter instead of freezing at the last value.
+            self.app.monitor_level = 0.0
 
     @property
     def active_speakers(self) -> int:
