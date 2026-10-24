@@ -75,3 +75,9 @@ flagged/
 .mypy_cache
 
 settings.json
+# Compose: per-setup extras and data folders
+docker-compose.override.yml
+argos_models/
+moonshine_models/
+fonts/
+settings/

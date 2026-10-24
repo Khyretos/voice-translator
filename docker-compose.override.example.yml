@@ -1,0 +1,16 @@
+# Optional extras for one setup. Copy to docker-compose.override.yml (gitignored); `docker compose
+# up -d` reads it on its own. Keep only what you use.
+services:
+  voice-translator:
+    # A sound card on this computer, for the "Microphone" audio source (Linux hosts).
+    devices:
+      - /dev/snd:/dev/snd
+    # kireserver: a fixed name for Nginx Proxy Manager, no published port, the proxy's network.
+    container_name: voice-translator
+    ports: !override []
+    networks: [default, outside]
+
+networks:
+  outside:
+    external: true
+    name: nginx-reverse-proxy_default

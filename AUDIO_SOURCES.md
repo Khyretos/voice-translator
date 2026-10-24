@@ -30,8 +30,8 @@ couple of common ways to do that:
 
   Then set Discord's output device to `discord_capture`, and this app's
   input to `discord_mic` (it'll show up in the dropdown as a normal input
-  device — no code change needed). This container already mounts
-  `/dev/snd:/dev/snd`; if it's not seeing PulseAudio-level devices (only
+  device — no code change needed). With `/dev/snd:/dev/snd` in the override (see
+  docker-compose.override.example.yml), if it's not seeing PulseAudio-level devices (only
   raw ALSA hardware), you'll additionally need to share the PulseAudio
   socket into the container (bind-mount `/run/user/<uid>/pulse` and set
   `PULSE_SERVER`), which is a docker-compose change, not an app change —

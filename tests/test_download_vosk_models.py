@@ -181,5 +181,41 @@ class TestDownloadModelExtraction:
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+class TestIfEmpty:
+    """--if-empty: the container's first start downloads a default model, later starts don't."""
+
+    def test_has_model_needs_a_real_model_folder(self, tmp_path):
+        models_dir = tmp_path / "vosk_models"
+        assert not dvm.has_model(models_dir)  # missing folder
+        (models_dir / "temp").mkdir(parents=True)
+        (models_dir / "half-extracted").mkdir()
+        assert not dvm.has_model(models_dir)  # only a temp and an empty folder
+        (models_dir / "vosk-model-small-xx-0.1" / "conf").mkdir(parents=True)
+        assert dvm.has_model(models_dir)
+
+    def test_if_empty_skips_the_catalog_when_a_model_exists(self, tmp_path, monkeypatch, capsys):
+        models_dir = tmp_path / "vosk_models"
+        (models_dir / "vosk-model-small-xx-0.1" / "am").mkdir(parents=True)
+        monkeypatch.setattr(dvm, "MODELS_DIR", models_dir)
+
+        def no_catalog():
+            raise AssertionError("must not fetch the catalog when a model is installed")
+
+        monkeypatch.setattr(dvm, "fetch_catalog", no_catalog)
+        monkeypatch.setattr(dvm.sys, "argv", ["download_vosk_models.py", "--if-empty", "vosk-model-small-en-us-0.15"])
+        dvm.main()
+        assert "nothing to download" in capsys.readouterr().out
+
+    def test_if_empty_downloads_into_an_empty_folder(self, tmp_path, monkeypatch):
+        models_dir = tmp_path / "vosk_models"
+        monkeypatch.setattr(dvm, "MODELS_DIR", models_dir)
+        monkeypatch.setattr(dvm, "fetch_catalog", lambda: SAMPLE_CATALOG)
+        fetched = []
+        monkeypatch.setattr(dvm, "download_model", lambda entry, d: fetched.append(entry["name"]) or True)
+        monkeypatch.setattr(dvm.sys, "argv", ["download_vosk_models.py", "--if-empty", "vosk-model-small-en-us-0.15"])
+        dvm.main()
+        assert fetched == ["vosk-model-small-en-us-0.15"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

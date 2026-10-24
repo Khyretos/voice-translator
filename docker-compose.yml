@@ -1,37 +1,29 @@
-version: "3.8"
-
+# Voice translator: docker compose up -d --build, then open http://<this computer>:7860.
+# The first start downloads a small English Vosk model (VOSK_DEFAULT_MODEL); Moonshine and
+# Whisper fetch their own. Models, fonts, logs and settings stay in the folders next to this file.
+# Everything else is optional: settings in .env (see .env.example), a sound card, a reverse
+# proxy's network or a fixed name in docker-compose.override.yml (see the .example).
 services:
   voice-translator:
     build: .
-    container_name: voice-translator
-    #    ports:
-    #      - "7860:7860"
+    image: ${VT_IMAGE:-voice-translator}
+    restart: unless-stopped
+    ports:
+      - "${VT_PORT:-7860}:7860" # 127.0.0.1:7860 keeps it to this computer (behind a proxy)
     volumes:
       - ./vosk_models:/app/vosk_models
       - ./argos_models:/app/argos_models
       - ./moonshine_models:/app/moonshine_models
       - ./fonts:/app/fonts
       - ./logs:/app/logs
-      - ./settings:/app/settings # per-session settings — was NOT mounted before, so settings.json was silently lost on every container restart/rebuild
-    devices:
-      - /dev/snd:/dev/snd # For audio access
+      - ./settings:/app/settings # per-session settings (settings.json)
     environment:
-      - GRADIO_SERVER_NAME=0.0.0.0
-      - GRADIO_SERVER_PORT=7860
-      # Sessions are permanent by default — nothing auto-closes an
-      # actively-listening session, ever, regardless of silence duration.
-      # This only controls whether *stopped* sessions left idle get their
-      # in-memory state freed (settings.json is never touched either way).
-      # 0 = disabled (default). Uncomment to opt in, e.g. 6h:
-      # - IDLE_SESSION_TIMEOUT_SECONDS=21600
-      # Optional: bot token for the "Discord Voice Channel" audio source, used
-      # by any session that leaves its own Bot token field empty. See DISCORD.md.
-      # - DISCORD_BOT_TOKEN=
-    restart: unless-stopped
-    networks:
-      - outside
-
-networks:
-  outside:
-    external: true
-    name: nginx-reverse-proxy_default
+      GRADIO_SERVER_NAME: 0.0.0.0
+      GRADIO_SERVER_PORT: "7860"
+      # Vosk model the first start downloads when vosk_models/ is empty; empty: none.
+      VOSK_DEFAULT_MODEL: ${VOSK_DEFAULT_MODEL-vosk-model-small-en-us-0.15}
+      # Free the memory of *stopped* sessions after this many idle seconds; 0 = never (default).
+      # A listening session is never closed.
+      IDLE_SESSION_TIMEOUT_SECONDS: ${IDLE_SESSION_TIMEOUT_SECONDS:-0}
+      # Bot token for the "Discord Voice Channel" source, for sessions that leave their own empty (DISCORD.md).
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}

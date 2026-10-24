@@ -48,5 +48,10 @@ EXPOSE 7860
 ENV GRADIO_SERVER_NAME="0.0.0.0"
 ENV GRADIO_SERVER_PORT="7860"
 
+# First start: a default Vosk model (docker-entrypoint.sh); empty VOSK_DEFAULT_MODEL skips it.
+ENV VOSK_DEFAULT_MODEL="vosk-model-small-en-us-0.15"
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
 # Run the application with host/port arguments
 CMD ["python", "voice_translator.py", "--host", "0.0.0.0", "--port", "7860"]
